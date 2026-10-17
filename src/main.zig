@@ -215,10 +215,31 @@ fn isOverlayMarker(name: []const u8) bool {
     return std.mem.eql(u8, name, ".wh..opq");
 }
 
+// Kernel overlayfs records an opaque directory as the "trusted.overlay.opaque"
+// xattr ("user." prefixed on an unprivileged mount); only fuse-overlayfs and
+// older kernels also leave a ".wh..wh..opq" file behind. getxattr has no wrapper
+// in this Zig release, so the syscall is issued directly.
+fn isOpaqueByXattr(path_z: [*:0]const u8) bool {
+    var buf: [4]u8 = undefined;
+    // getxattr takes a NUL-terminated name, hence [*:0] rather than []const u8.
+    const names = [_][*:0]const u8{ "trusted.overlay.opaque", "user.overlay.opaque" };
+    for (names) |name| {
+        const r = linux.syscall3(linux.SYS.getxattr, @intFromPtr(path_z), @intFromPtr(name), @intFromPtr(&buf));
+        if (sandbox.errnoFromSyscall(@intCast(r)) != .SUCCESS) continue;
+        if (r >= 1 and buf[0] == 'y') return true;
+    }
+    return false;
+}
+
 // A directory the sandbox created is marked opaque: its contents replace the
 // target directory's contents entirely. readdir hands the marker back in
 // arbitrary order, so it has to be looked for before the contents are replayed.
 fn hasOpaqueMarker(src_dir: []const u8) bool {
+    // The xattr form first: it is what the kernel driver leaves, and it is there
+    // even when the directory ended up empty.
+    if (zPath(src_dir)) |z| {
+        if (isOpaqueByXattr(z)) return true;
+    }
     var dir = sandbox.DirStream.open(src_dir) orelse return false;
     defer dir.close();
     while (dir.next()) |entry| {
@@ -435,7 +456,12 @@ fn handleEnterModeChanges(config: Config) void {
     } else if (std.mem.eql(u8, trimmed, "d") or std.mem.eql(u8, trimmed, "D") or std.mem.eql(u8, trimmed, "diff")) {
         // Show full diff (--no-pager to avoid "terminal not fully functional" issues)
         const full_diff_argv = [_][]const u8{ "git", "--no-pager", "diff", "--no-index", target_dir, changes_path };
-        _ = sandbox.runProcess(&full_diff_argv);
+        const diff_rc = sandbox.runProcess(&full_diff_argv);
+        if (diff_rc == null or diff_rc.? == 127) {
+            // execvp failed in the child, which exits 127 silently: say why the
+            // diff is missing instead of leaving the prompt with no output.
+            warn("cannot show diff: git is not installed", .{});
+        }
 
         // Prompt again
         print("\n{s}Apply these changes?{s} [y/N]: ", .{ c1, c2 });

@@ -9,6 +9,9 @@ const POOF_BIN = join(import.meta.dir, "../zig-out/bin/poof");
 let TEST_DIR: string;
 // Shell prompt: # for root, $ for non-root
 const SHELL_PROMPT = process.getuid?.() === 0 ? "# " : "$ ";
+// poof's diff view is `git diff --no-index`, so with no git on the box there is
+// nothing to show and the diff tests have nothing to assert on.
+const hasGit = spawnSync(["sh", "-c", "command -v git"]).exitCode === 0;
 
 // poof prints "Stashed changes in <dir>" when changes are kept; pull the path
 // out of the (possibly colorized) output so tests can assert on it and clean up.
@@ -313,7 +316,9 @@ describe("poof CLI", () => {
       });
 
       test("/dev/zero is available", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "head -c 4 /dev/zero | xxd -p"]);
+        // od, not xxd: xxd is a vim companion tool and is often absent, whereas
+        // od is in coreutils.
+        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "head -c 4 /dev/zero | od -An -tx1 | tr -d ' \\n'"]);
         expect(result.stdout.toString().trim()).toBe("00000000");
         expect(result.exitCode).toBe(0);
       });
@@ -889,7 +894,7 @@ describe("poof CLI", () => {
       cleanupStash(session.output);
     });
 
-    test("shows diff when user presses d", async () => {
+    (hasGit ? test : test.skip)("shows diff when user presses d", async () => {
       const testFile = join(enterTestDir, "difftest.txt");
       const session = new TerminalSession(enterTestDir);
 
@@ -1235,7 +1240,7 @@ describe("poof CLI", () => {
       rmSync(stash!, { recursive: true, force: true });
     });
 
-    test("d shows the full diff, then y applies", async () => {
+    (hasGit ? test : test.skip)("d shows the full diff, then y applies", async () => {
       const testFile = join(runDir, "run-diff.txt");
       const session = new TerminalSession(
         runDir, undefined, ["sh", "-c", `echo diff-marker-91 > ${testFile}`], "run");
@@ -1478,6 +1483,31 @@ describe("poof CLI", () => {
       expect(readFileSync(join(targetDir, "f.txt"), "utf8")).toBe("f\n");
     });
 
+    // A device node needs CAP_MKNOD, so probe for it rather than assuming root:
+    // that is what lets the whiteout-vs-real-device distinction be tested at all.
+    const mknodProbe = mkdtempSync(join("/var/tmp", "poof-mknod-probe-"));
+    const canMknod = spawnSync(["sh", "-c", `mknod ${join(mknodProbe, "node")} c 1 3`]).exitCode === 0;
+    rmSync(mknodProbe, { recursive: true, force: true });
+    const deviceTest = canMknod ? test : test.skip;
+
+    deviceTest("a real character device is not mistaken for a whiteout", () => {
+      // The kernel's whiteout is a character device with rdev 0; a device node a
+      // program created has a non-zero rdev. Only root (or a container granted
+      // CAP_MKNOD) can produce the second one.
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      expect(spawnSync(["sh", "-c", `mknod ${join(mirrored, "node")} c 1 3`]).exitCode).toBe(0);
+      writeFileSync(join(targetDir, "node"), "keep me\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      const out = r.stdout.toString() + r.stderr.toString();
+      // Reported as an unsupported file type, not applied as a deletion: had it
+      // been read as a whiteout, the target's file would be gone and the exit 0.
+      expect(out).toContain("skipping unsupported file type");
+      expect(r.exitCode).toBe(1);
+      expect(readFileSync(join(targetDir, "node"), "utf8")).toBe("keep me\n");
+    });
+
     test("an empty stash applies nothing", () => {
       const r = spawnSync([POOF_BIN, "apply", stashDir]);
       expect(r.stdout.toString() + r.stderr.toString()).toContain("no changes in");
@@ -1546,6 +1576,92 @@ describe("poof CLI", () => {
       expect(existsSync(stash!)).toBe(false); // applied in full: the stash is cleaned up
 
       cleanupStash(session.output);
+      rmSync(dir, { recursive: true, force: true });
+    }, 30_000);
+  });
+
+  // ============================================================================
+  // The kernel overlay driver (only reachable as root)
+  // ============================================================================
+  describe("kernel overlay driver", () => {
+    const kernelTest = process.getuid?.() === 0 ? test : test.skip;
+
+    // A root session mounts the kernel's overlayfs, so the stash it leaves is in
+    // the kernel's own format. The suite's other apply tests build stashes by
+    // hand; these go through a real session, which is the only way to see what
+    // the driver actually writes.
+    function sessionUpper(name: string) {
+      const dir = mkdtempSync(join(TEST_DIR, `${name}-target-`));
+      return { dir, upper: join(TEST_DIR, `${name}-upper`) };
+    }
+
+    kernelTest("a deleted file becomes a 0:0 character device, and apply deletes it", () => {
+      const { dir, upper } = sessionUpper("kwhiteout");
+      const victim = join(dir, "victim.txt");
+      writeFileSync(victim, "delete me\n");
+
+      const run = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", `rm ${victim}`]);
+      expect(run.exitCode).toBe(0);
+
+      // The kernel's whiteout form: a character device whose rdev is 0:0.
+      const st = lstatSync(join(upper, victim.slice(1)));
+      expect(st.isCharacterDevice()).toBe(true);
+      expect(st.rdev).toBe(0);
+
+      const r = spawnSync([POOF_BIN, "apply", upper, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(victim)).toBe(false);
+      rmSync(dir, { recursive: true, force: true });
+    }, 30_000);
+
+    kernelTest("a deleted directory is deleted, not merged into the target", () => {
+      const { dir, upper } = sessionUpper("kdirdel");
+      mkdirSync(join(dir, "sub", "deep"), { recursive: true });
+      writeFileSync(join(dir, "sub", "deep", "inner.txt"), "inner\n");
+
+      const run = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", `rm -rf ${dir}/sub`]);
+      expect(run.exitCode).toBe(0);
+
+      const r = spawnSync([POOF_BIN, "apply", upper, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(join(dir, "sub"))).toBe(false);
+      rmSync(dir, { recursive: true, force: true });
+    }, 30_000);
+
+    kernelTest("a recreated directory replaces the target's contents, xattr marker and all", () => {
+      // The kernel marks a recreated directory opaque with the
+      // trusted.overlay.opaque xattr and leaves no .wh..wh..opq file, so the
+      // marker check has to look at the xattr; reading only the file let files
+      // the sandbox never saw survive on the target.
+      const { dir, upper } = sessionUpper("kopaque");
+      mkdirSync(join(dir, "sub"));
+      writeFileSync(join(dir, "sub", "old.txt"), "old\n");
+
+      const run = spawnSync([
+        POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c",
+        `rm -rf ${dir}/sub && mkdir ${dir}/sub && echo new > ${dir}/sub/new.txt`,
+      ]);
+      expect(run.exitCode).toBe(0);
+      expect(existsSync(join(upper, dir.slice(1), "sub", ".wh..wh..opq"))).toBe(false);
+
+      const r = spawnSync([POOF_BIN, "apply", upper, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readdirSync(join(dir, "sub"))).toEqual(["new.txt"]);
+      rmSync(dir, { recursive: true, force: true });
+    }, 30_000);
+
+    kernelTest("a directory recreated empty leaves the target directory empty", () => {
+      const { dir, upper } = sessionUpper("kopaque-empty");
+      mkdirSync(join(dir, "sub"));
+      writeFileSync(join(dir, "sub", "a.txt"), "a\n");
+      writeFileSync(join(dir, "sub", "b.txt"), "b\n");
+
+      const run = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", `rm -rf ${dir}/sub && mkdir ${dir}/sub`]);
+      expect(run.exitCode).toBe(0);
+
+      const r = spawnSync([POOF_BIN, "apply", upper, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readdirSync(join(dir, "sub"))).toEqual([]);
       rmSync(dir, { recursive: true, force: true });
     }, 30_000);
   });

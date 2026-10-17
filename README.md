@@ -296,6 +296,32 @@ docker run -it --cap-add=SYS_ADMIN --security-opt seccomp=unconfined ubuntu bash
 poof exec echo "Works with kernel overlay!"
 ```
 
+### Persisting changes inside a container (`run` / `enter`)
+
+`exec` works anywhere. `run` and `enter` additionally need somewhere to keep the
+changes, and the kernel refuses an upper dir that is itself on an overlay - which
+a container root normally is. Put the upper dir on a filesystem that is not an
+overlay:
+
+```bash
+docker run -it --privileged --tmpfs /var/tmp ubuntu bash
+poof run --upper=/var/tmp/changes -- make   # review and apply afterwards
+poof apply /var/tmp/changes
+```
+
+poof says so rather than failing obscurely:
+
+```
+✗ error: 'run' mode needs --upper on a filesystem that is not an overlay
+✗ error: /var/tmp/up is on overlayfs - put it on a tmpfs or a volume (in Docker: --tmpfs /var/tmp)
+```
+
+Note that a `--tmpfs` mount is only for the upper dir: a *target* directory that
+lives on a nested mount is not visible inside the sandbox, because the sandbox
+overlays the container's own root. Run the test suite in a container with
+`./scripts/test-docker.sh`, which moves the container onto a plain tmpfs root so
+the whole tree can be overlaid.
+
 ### Docker Permission Reference
 
 | Flag | Why needed |
@@ -341,6 +367,33 @@ poof exec echo "Works with kernel overlay!"
 
 ---
 
+## Testing
+
+```bash
+zig build      # produces zig-out/bin/poof, which the suite drives
+bun test       # as a regular user: root-only cases skip
+```
+
+Some behaviour only exists as root, so a normal host run cannot cover it: the
+kernel overlay driver (a deleted file becomes a `0:0` character device, a
+recreated directory is marked opaque with the `trusted.overlay.opaque` xattr)
+where an unprivileged run uses fuse-overlayfs (`.wh.` files instead), real device
+nodes (CAP_MKNOD), and cgroup delegation. Run those in a container:
+
+```bash
+./scripts/test-docker.sh                        # docker
+POOF_CONTAINER_RUNTIME=podman ./scripts/test-docker.sh
+POOF_TEST_APT=git ./scripts/test-docker.sh      # also cover the `d` diff view
+```
+
+The script starts a privileged container, moves it onto a plain tmpfs root (poof
+cannot overlay a container's overlayfs root), turns on cgroup delegation, then
+builds with the host's zig and bun bind mounted and runs the whole suite as root.
+Cases whose prerequisites are missing - no root, no CAP_MKNOD, no cgroup
+delegation, no git for the diff view - skip instead of failing.
+
+---
+
 ## What poof does and doesn't isolate
 
 | Isolated | Not isolated |
@@ -359,7 +412,9 @@ poof is designed to make **filesystem changes reversible**, not to provide full 
 
 - **Linux only** — Uses Linux-specific kernel features (namespaces, overlayfs)
 - **Overlay depth** — Maximum 2 levels of overlay stacking (kernel limit)
-- **`run` mode in containers** — Doesn't work inside overlay environments; use `exec`
+- **`run` mode in containers** — the kernel refuses an upper dir that sits on an
+  overlay mount, and a container root usually is one; point `--upper` at a tmpfs
+  or a volume, or use `exec` (see [Docker / Container Support](#docker--container-support))
 - **Special filesystems** — `/proc`, `/sys`, `/dev` are remounted fresh
 
 ---

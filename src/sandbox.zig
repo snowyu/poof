@@ -775,6 +775,60 @@ fn isInOverlayEnvironment() bool {
     return false;
 }
 
+// /proc/mounts escapes whitespace in mount points as \040, \011 and \012.
+fn unescapeMount(raw: []const u8, buf: []u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (n >= buf.len) return null;
+        if (raw[i] == '\\' and i + 3 < raw.len) {
+            const octal = std.fmt.parseInt(u8, raw[i + 1 .. i + 4], 8) catch { //
+                buf[n] = raw[i];
+                n += 1;
+                i += 1;
+                continue;
+            };
+            buf[n] = octal;
+            n += 1;
+            i += 4;
+            continue;
+        }
+        buf[n] = raw[i];
+        n += 1;
+        i += 1;
+    }
+    return buf[0..n];
+}
+
+/// Filesystem type of the mount a path sits on, from /proc/mounts. The path does
+/// not have to exist: the longest mount point that prefixes it wins.
+pub fn fsTypeOf(path: []const u8) ?[]const u8 {
+    var buf: [8192]u8 = undefined;
+    const n = readFile("/proc/mounts", &buf) catch return null;
+    const data = buf[0..n];
+
+    var name_buf: [4096]u8 = undefined;
+    var best: ?[]const u8 = null;
+    var best_len: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line| {
+        var parts = std.mem.splitScalar(u8, line, ' ');
+        _ = parts.next(); // device
+        const raw = parts.next() orelse continue; // mount point
+        const fstype = parts.next() orelse continue;
+        const point = unescapeMount(raw, &name_buf) orelse continue;
+        if (point.len <= best_len) continue;
+        const covers = std.mem.eql(u8, point, "/") or
+            (std.mem.startsWith(u8, path, point) and path.len > point.len and path[point.len] == '/');
+        if (covers) {
+            best = fstype;
+            best_len = point.len;
+        }
+    }
+    return best;
+}
+
 // ============================================================================
 // Overlay Setup
 // ============================================================================
@@ -789,13 +843,6 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     var work_dir: []const u8 = undefined;
     var merged_dir: []const u8 = undefined;
     var temp_base: []const u8 = undefined;
-
-    // run mode with user-specified upper dir won't work in overlay environment
-    if (in_overlay and config.mode == .run) {
-        err("'run' mode not supported in overlay environment (Docker/container)", .{});
-        err("use 'exec' mode instead - changes can't persist to overlay filesystem", .{});
-        return .{ .err = .INVAL };
-    }
 
     if (config.mode == .exec) {
         // Use temp dir created by parent before fork (so parent knows path for cleanup)
@@ -844,6 +891,27 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
 
         merged_dir = std.fmt.allocPrint(allocator, "{s}/merged", .{temp_base}) catch return .{ .err = .NOMEM };
         // cleanup_work_dir and cleanup_merged_base are set by parent before fork
+    }
+
+    // Kernel overlayfs refuses an upperdir that is itself on an overlay mount -
+    // that is what makes 'run' mode fail inside Docker, where the container root
+    // is overlayfs. The constraint belongs to the upper dir's own filesystem, not
+    // to the root's: an upper on tmpfs or on a bind-mounted volume works, so only
+    // refuse when the upper really is on overlay. fuse-overlayfs (used when there
+    // is no real root) still refuses, as before.
+    if (config.mode == .run and use_kernel_overlay) {
+        if (fsTypeOf(upper_dir)) |fstype| {
+            if (std.mem.eql(u8, fstype, "overlay")) {
+                err("'run' mode needs --upper on a filesystem that is not an overlay", .{});
+                err("{s} is on overlayfs - put it on a tmpfs or a volume (in Docker: --tmpfs /var/tmp)", .{upper_dir});
+                return .{ .err = .INVAL };
+            }
+        }
+    }
+    if (config.mode == .run and !use_kernel_overlay and in_overlay) {
+        err("'run' mode not supported in overlay environment (Docker/container)", .{});
+        err("use 'exec' mode instead - changes can't persist to overlay filesystem", .{});
+        return .{ .err = .INVAL };
     }
 
     // Create the upper directory (and any missing parents), then check it really
