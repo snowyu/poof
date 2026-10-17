@@ -910,6 +910,19 @@ pub fn run(config: Config) u8 {
     }
     log("uid={} gid={}", .{ orig_uid, orig_gid });
 
+    // The overlay's lower layer is the root mount, so a working directory that sits
+    // on a mount below it is outside the sandbox's view: with the kernel driver the
+    // mounted tree is not even visible inside, and either way writes there go to the
+    // upper dir instead of that filesystem. Say so before running anything.
+    var point_buf: [4096]u8 = undefined;
+    var fstype_buf: [64]u8 = undefined;
+    if (sandbox.mountOf(config.cwd, &point_buf, &fstype_buf)) |m| {
+        if (!std.mem.eql(u8, m.point, "/")) {
+            warn("{s} sits on the {s} mount at {s}, not the root filesystem", .{ config.cwd, m.fstype, m.point });
+            info("poof overlays the root mount only: as root the mounted tree is not visible inside the sandbox, and writes there land in the upper dir instead", .{});
+        }
+    }
+
     // Set up cgroups BEFORE fork so child inherits limits
     if (config.memory_limit != null or config.pids_limit != null) {
         sandbox.setupCgroup(config) catch |cgroup_err| {

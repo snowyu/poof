@@ -800,16 +800,24 @@ fn unescapeMount(raw: []const u8, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-/// Filesystem type of the mount a path sits on, from /proc/mounts. The path does
-/// not have to exist: the longest mount point that prefixes it wins.
-pub fn fsTypeOf(path: []const u8) ?[]const u8 {
+pub const Mount = struct {
+    point: []const u8,
+    fstype: []const u8,
+};
+
+/// The mount a path sits on, from /proc/mounts: the longest mount point that
+/// prefixes it. The path does not have to exist. point_buf/fstype_buf receive the
+/// winning entry (mount points are unescaped from \040-style octal), so the result
+/// outlives the mount table buffer.
+pub fn mountOf(path: []const u8, point_buf: []u8, fstype_buf: []u8) ?Mount {
     var buf: [8192]u8 = undefined;
     const n = readFile("/proc/mounts", &buf) catch return null;
     const data = buf[0..n];
 
     var name_buf: [4096]u8 = undefined;
-    var best: ?[]const u8 = null;
-    var best_len: usize = 0;
+    var found = false;
+    var point_len: usize = 0;
+    var fstype_len: usize = 0;
 
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |line| {
@@ -818,15 +826,32 @@ pub fn fsTypeOf(path: []const u8) ?[]const u8 {
         const raw = parts.next() orelse continue; // mount point
         const fstype = parts.next() orelse continue;
         const point = unescapeMount(raw, &name_buf) orelse continue;
-        if (point.len <= best_len) continue;
-        const covers = std.mem.eql(u8, point, "/") or
-            (std.mem.startsWith(u8, path, point) and path.len > point.len and path[point.len] == '/');
-        if (covers) {
-            best = fstype;
-            best_len = point.len;
+        if (point.len <= point_len) continue;
+        // The path is on this mount when it is the mount point itself, or sits below
+        // it. A one-character point is "/", which covers every absolute path.
+        const covers = std.mem.eql(u8, path, point) or
+            (std.mem.startsWith(u8, path, point) and (point.len == 1 or path[point.len] == '/'));
+        // Copied out on the spot: name_buf is reused for the next line, so a slice
+        // of it would be overwritten before the loop ends.
+        if (covers and point.len <= point_buf.len and fstype.len <= fstype_buf.len) {
+            @memcpy(point_buf[0..point.len], point);
+            @memcpy(fstype_buf[0..fstype.len], fstype);
+            point_len = point.len;
+            fstype_len = fstype.len;
+            found = true;
         }
     }
-    return best;
+
+    if (!found) return null;
+    return Mount{ .point = point_buf[0..point_len], .fstype = fstype_buf[0..fstype_len] };
+}
+
+/// Filesystem type of the mount a path sits on. Allocated from the global arena.
+pub fn fsTypeOf(path: []const u8) ?[]const u8 {
+    var point_buf: [4096]u8 = undefined;
+    var fstype_buf: [64]u8 = undefined;
+    const m = mountOf(path, &point_buf, &fstype_buf) orelse return null;
+    return std.fmt.allocPrint(allocator, "{s}", .{m.fstype}) catch null;
 }
 
 // ============================================================================

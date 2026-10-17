@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { spawn, spawnSync } from "bun";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync, symlinkSync, chmodSync } from "fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync, realpathSync, symlinkSync, chmodSync } from "fs";
 import { join } from "path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -476,6 +476,95 @@ describe("poof CLI", () => {
           expect(result.exitCode).toBe(1);
         }
       });
+    });
+  });
+
+  // ============================================================================
+  // Nested mounts
+  // ============================================================================
+  describe("nested mounts", () => {
+    // The overlay's lower layer is the root mount, so a working directory on a
+    // mount below it is outside what poof captures (and, as root, outside what the
+    // sandbox can even see). poof warns; which mounts exist is environment-specific,
+    // so probe for a usable one instead of assuming /dev/shm is there.
+    const mountPoints = readFileSync("/proc/mounts", "utf8")
+      .split("\n")
+      .map((line) => (line.split(" ")[1] ?? "")
+        .replace(/\\040/g, " ").replace(/\\011/g, "\t").replace(/\\012/g, "\n"))
+      .filter((p) => p.length > 0);
+
+    const deepestMount = (path: string): string => {
+      let best = "/";
+      for (const m of mountPoints) {
+        if (m.length > best.length && (path === m || path.startsWith(m + "/"))) best = m;
+      }
+      return best;
+    };
+
+    // A mount point that exists, is writable, and can hold a temp working dir.
+    const nestedBase = (() => {
+      for (const candidate of ["/dev/shm", "/run/shm", `/run/user/${process.getuid?.() ?? 0}`]) {
+        if (!existsSync(candidate)) continue;
+        if (deepestMount(candidate) !== candidate) continue; // must itself be a mount point
+        try {
+          const probe = join(candidate, `poof-writable-${process.pid}`);
+          writeFileSync(probe, "x\n");
+          rmSync(probe, { force: true });
+          return candidate;
+        } catch {
+          // not writable here - try the next candidate
+        }
+      }
+      return null;
+    })();
+
+    const mountTest = nestedBase ? test : test.skip;
+    let nestedDir: string | null = null;
+
+    beforeEach(() => {
+      // realpath: poof reports getcwd(), which has symlinks resolved already.
+      if (nestedBase) nestedDir = realpathSync(mkdtempSync(join(nestedBase, "poof-nested-")));
+    });
+    afterEach(() => {
+      if (nestedDir) rmSync(nestedDir, { recursive: true, force: true });
+      nestedDir = null;
+    });
+
+    mountTest("warns when the working directory sits on a mount poof does not overlay", () => {
+      const dir = nestedDir!;
+      const result = spawnSync([POOF_BIN, "exec", "--", "true"], { cwd: dir });
+      const output = result.stderr.toString();
+      expect(output).toContain("not the root filesystem");
+      expect(output).toContain(dir);
+      expect(output).toContain(`mount at ${deepestMount(dir)}`);
+      // a warning, not a refusal
+      expect(result.exitCode).toBe(0);
+    });
+
+    mountTest("warns when the working directory is the mount point itself", () => {
+      const base = nestedBase!;
+      const result = spawnSync([POOF_BIN, "exec", "--", "true"], { cwd: base });
+      const output = result.stderr.toString();
+      expect(output).toContain(`mount at ${base}`);
+      expect(result.exitCode).toBe(0);
+    });
+
+    mountTest("run mode warns too, before the session starts", () => {
+      const dir = nestedDir!;
+      const result = spawnSync(
+        [POOF_BIN, "run", `--upper=${join(TEST_DIR, "nested-upper")}`, "--", "true"],
+        { cwd: dir },
+      );
+      const output = result.stdout.toString() + result.stderr.toString();
+      expect(output).toContain("not the root filesystem");
+      expect(result.exitCode).toBe(0);
+    });
+
+    test("says nothing when the working directory is on the root filesystem", () => {
+      if (deepestMount(TEST_DIR) !== "/") return; // TEST_DIR is itself on a mount here
+      const result = spawnSync([POOF_BIN, "exec", "--", "true"], { cwd: TEST_DIR });
+      expect(result.stderr.toString()).not.toContain("not the root filesystem");
+      expect(result.exitCode).toBe(0);
     });
   });
 

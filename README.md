@@ -290,6 +290,21 @@ volume, a `--tmpfs` — poof is not overlaying it: run poof where that filesyste
 the root (inside a container, that is what `./scripts/test-docker.sh` arranges by
 moving the container onto a plain tmpfs root).
 
+poof says so up front rather than letting you find out from a lost write. Before an
+`exec`/`run`/`enter` session starts it looks up the working directory (for `enter`, the
+target directory) in `/proc/mounts`, and warns if the mount covering it is not the root
+mount:
+
+```console
+$ cd /dev/shm/some-workdir && poof exec -- make
+⚠ /dev/shm/some-workdir sits on the tmpfs mount at /dev/shm, not the root filesystem
+● poof overlays the root mount only: as root the mounted tree is not visible inside the sandbox, and writes there land in the upper dir instead
+```
+
+It is a warning, not a refusal: the session still runs, and a command that only reads
+the nested mount (or writes to the root mount) is unaffected. Nothing is printed when
+the working directory is on the root mount, which is the normal case.
+
 ---
 
 ## Running Unprivileged
@@ -467,7 +482,7 @@ poof is designed to make **filesystem changes reversible**, not to provide full 
   or a volume, or use `exec` (see [Docker / Container Support](#docker--container-support))
 - **Special filesystems** — `/proc`, `/sys`, `/dev` are remounted fresh
 - **Nested mounts** — the lower layer is the root mount, so filesystems mounted
-  under it sit outside the overlay
+  under it sit outside the overlay; poof warns when the working directory is on one
   ([Filesystems mounted under the root](#filesystems-mounted-under-the-root))
 
 ---
