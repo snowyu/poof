@@ -151,7 +151,11 @@ This is ideal for:
 | `--upper=<dir>` | Directory for persistent changes (`run` mode) |
 | `--timeout=<secs>` | Kill process after N seconds (exit code 124) |
 | `--memory=<size>` | Memory limit, e.g. `100M`, `1G` |
-| `--pids=<max>` | Max processes (fork bomb protection) |
+| `--pids=<max>` | Max processes (fork bomb protection, minimum 2) |
+
+`--pids` must be at least 2: the sandbox always runs a tiny init plus the command, and
+one more process for `fuse-overlayfs` when running unprivileged. A limit that cannot
+boot the sandbox is rejected up front instead of failing inside it.
 
 ### Resource Limits
 
@@ -194,7 +198,7 @@ poof uses Linux kernel features to create complete isolation:
 | Namespace | Isolation |
 |-----------|-----------|
 | **Mount** | Private mount tree with overlayfs |
-| **PID** | Isolated process tree (command becomes PID 1) |
+| **PID** | Isolated process tree (nothing outside the sandbox is visible) |
 | **UTS** | Isolated hostname |
 | **IPC** | Isolated System V IPC |
 
@@ -350,7 +354,8 @@ When you run `poof exec <command>`:
           ├── Set up uid/gid mappings (user namespace)
           └── fork()  ← Required to enter new PID namespace
               │
-              3. Second child (PID 1 in new namespace)
+              3. Second child (PID 1 in new namespace — the "tiny init")
+                 ├── Join the limit cgroup (if resource limits specified)
                  ├── Mount tmpfs on /tmp/poof-<random>/
                  ├── Create upper/, work/, merged/ directories
                  ├── Mount overlay:
@@ -362,7 +367,12 @@ When you run `poof exec <command>`:
                  ├── pivot_root(merged, merged/.oldroot)
                  ├── umount(/.oldroot, MNT_DETACH)
                  ├── Mount fresh /proc and /tmp
-                 ├── execve(<command>)
+                 ├── fork() + execve(<command>)
+                 │     └── The command is a child of PID 1, not PID 1 itself: the
+                 │         kernel discards unhandled SIGTERM/SIGINT for a pid
+                 │         namespace's init and swallows crash signals, so running
+                 │         the command directly would lose signal-driven exit codes.
+                 │         PID 1 forwards INT/TERM/HUP/QUIT and reports 128+signum.
                  └── [command runs with full filesystem illusion]
 ```
 
@@ -395,7 +405,7 @@ In `run`/`enter` mode upperdir is the user's own directory and workdir sits besi
 | Namespace | What it isolates | Effect in poof |
 |-----------|------------------|----------------|
 | **Mount (CLONE_NEWNS)** | Mount table | Overlay mounts are private; host sees nothing |
-| **PID (CLONE_NEWPID)** | Process IDs | Command becomes PID 1; can't see/signal host processes |
+| **PID (CLONE_NEWPID)** | Process IDs | Sandbox has its own tree under a tiny init at PID 1; can't see/signal host processes |
 | **UTS (CLONE_NEWUTS)** | Hostname | Container gets isolated hostname |
 | **IPC (CLONE_NEWIPC)** | System V IPC | Shared memory, semaphores, message queues isolated |
 | **User (CLONE_NEWUSER)** | UID/GID mappings | Non-root users get "fake root" inside namespace |
@@ -418,17 +428,27 @@ Dangerous devices like `/dev/sda`, `/dev/mem` are **not** exposed — the sandbo
 
 ### Cgroups v2 Resource Limits
 
-When you specify `--memory`, `--pids`, or `--timeout`:
+`--memory` and `--pids` are enforced with a cgroup v2 leaf created next to poof's
+own cgroup — the closest ancestor of the current cgroup that allows creating a
+limited child (a cgroup with processes attached cannot enable controllers for its
+children, so under systemd this usually lands in `app.slice` rather than the top of
+the hierarchy, which is why it also works for unprivileged users):
 
 ```
-/sys/fs/cgroup/poof-<pid>/
-├── cgroup.procs          ← Child PID written here
-├── memory.max            ← --memory limit (e.g., "104857600" for 100M)
-├── pids.max              ← --pids limit (e.g., "50")
-└── memory.oom.group      ← Set to 1 (kill all on OOM)
+<nearest workable cgroup>/poof-<random>/
+├── cgroup.procs          ← Sandbox PID written here by the sandbox child itself
+├── memory.max            ← --memory limit (e.g. "104857600" for 100M)
+├── memory.swap.max       ← 0 (memory.max is only a real cap if swap is pinned off)
+├── memory.oom.group      ← 1 (kill the whole sandbox on OOM)
+└── pids.max              ← --pids limit (e.g. "50")
 ```
 
-The parent process monitors the child. On timeout, it sends SIGKILL. On OOM, the kernel kills the entire cgroup.
+poof's own process stays outside the cgroup, so an OOM kill takes the sandbox down
+while the parent survives to clean up (exit code 137). If no place in the hierarchy
+allows this, poof fails with a clear error instead of running unlimited.
+
+`--timeout` is not a cgroup feature: the parent watches the clock and sends SIGKILL
+(exit code 124).
 
 ### Root vs Non-Root Execution
 
@@ -506,6 +526,10 @@ When the command exits, you'll see:
     n — Discard (keep in temp dir)
     d — Show full diff first
 
+If the session ends abnormally (`--timeout`, or SIGINT/SIGTERM/SIGHUP to poof), the
+changes are never destroyed silently: they are kept in the temp dir and poof prints
+`Stashed changes in <dir>`.
+
 OPTIONS
   --upper=<dir>       Save changes to directory (skip prompt)
   --timeout=<secs>    Kill after N seconds
@@ -520,7 +544,7 @@ OPTIONS
 poof enter — Interactive shell with review on exit
 
 USAGE
-  poof enter [options]
+  poof enter [options] [directory]
 
 Opens your $SHELL in an isolated environment. When you exit:
   1. See a summary of all changes
@@ -529,9 +553,13 @@ Opens your $SHELL in an isolated environment. When you exit:
 EXAMPLES
   $ poof enter                        # Start isolated shell
   $ poof enter -v                     # With verbose output
+  $ poof enter /etc                   # Sandbox /etc, shell starts there
 
 OPTIONS
   -v, --verbose       Show detailed progress
+  --timeout=<secs>    Kill after N seconds
+  --memory=<size>     Memory limit (e.g. 100M, 1G)
+  --pids=<max>        Max processes
 ```
 
 ### `poof` (no args)

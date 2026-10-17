@@ -38,6 +38,18 @@ pub fn errnoFromSyscall(r: usize) Errno {
     return @fromBackingInt(@intCast(int));
 }
 
+// linux.fork() returns a raw usize: on failure the kernel's -errno is bit-cast into
+// it, so the value must be read as signed before it is used as a pid. Comparing the
+// usize directly makes every failure look like a valid (huge) child pid.
+pub const ForkResult = struct { pid: i32, errno: Errno };
+
+pub fn forkChild() ForkResult {
+    const r = linux.fork();
+    const e = errnoFromSyscall(r);
+    if (e != .SUCCESS) return .{ .pid = -1, .errno = e };
+    return .{ .pid = @intCast(@as(isize, @bitCast(r))), .errno = .SUCCESS };
+}
+
 pub const Mode = enum {
     exec, // tmpfs overlay - ephemeral, changes vanish
     run, // persistent upper dir, changes saved
@@ -176,6 +188,40 @@ pub fn makeDirPath(path: []const u8) FsError!void {
     if (e != .SUCCESS) return fsError(e);
 }
 
+/// mkdir -p: create `path` and any missing parents.
+pub fn makeDirs(path: []const u8) FsError!void {
+    if (path.len == 0) return;
+    if (path.len > 4000) return error.NameTooLong;
+
+    var buf: [4096]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    const n = path.len;
+
+    var i: usize = 1;
+    while (i <= n) : (i += 1) {
+        if (i < n and buf[i] != '/') continue;
+        const saved = buf[i];
+        buf[i] = 0;
+        const seg: [*:0]const u8 = buf[0..i :0];
+        const e = errnoFromSyscall(linux.mkdir(seg, 0o755));
+        switch (e) {
+            .SUCCESS, .EXIST => {},
+            else => return fsError(e),
+        }
+        buf[i] = saved;
+    }
+}
+
+/// True when `path` exists and is a directory (opening with O_DIRECTORY is the
+/// portable way to ask, no stat layout differences per architecture).
+pub fn isDirectory(path: []const u8) bool {
+    const p = posix.toPosixPath(path) catch return false;
+    const fd = linux.open(&p, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    if (errnoFromSyscall(fd) != .SUCCESS) return false;
+    _ = linux.close(@intCast(fd));
+    return true;
+}
+
 pub fn deleteDirPath(path: []const u8) FsError!void {
     const p = posix.toPosixPath(path) catch return error.NameTooLong;
     const e = errnoFromSyscall(linux.rmdir(&p));
@@ -277,13 +323,13 @@ pub fn runProcess(argv: []const []const u8) ?u8 {
         argvz[i] = (allocator.dupeSentinel(u8, arg, 0) catch return null).ptr;
     }
 
-    const pid = linux.fork();
-    if (pid == 0) {
+    const forked = forkChild();
+    if (forked.pid == 0) {
         _ = execvp(argvz[0].?, argvz.ptr);
         c._exit(127);
-    } else if (pid > 0) {
+    } else if (forked.pid > 0) {
         var status: i32 = 0;
-        const waited = linux.waitpid(@intCast(pid), &status, 0);
+        const waited = linux.waitpid(forked.pid, &status, 0);
         if (errnoFromSyscall(waited) != .SUCCESS) return null;
         const us: u32 = @bitCast(status);
         if (linux.W.IFEXITED(us)) return linux.W.EXITSTATUS(us);
@@ -352,6 +398,172 @@ fn getOriginalCgroup() ?[]const u8 {
     return null;
 }
 
+/// Read our own cgroup path from /proc/self/cgroup, e.g. "/user.slice/.../app.slice/foo.scope".
+fn getMyCgroupRel() ?[]const u8 {
+    var buf: [1024]u8 = undefined;
+    const n = readFile("/proc/self/cgroup", &buf) catch return null;
+    const data = buf[0..n];
+    const idx = std.mem.indexOf(u8, data, "::") orelse return null;
+    const rest = data[idx + 2 ..];
+    const end = std.mem.indexOf(u8, rest, "\n") orelse rest.len;
+    var rel = rest[0..end];
+    if (rel.len == 0 or rel[0] != '/') return null;
+    if (std.mem.eql(u8, rel, "/")) rel = ""; // the root cgroup
+    return std.fmt.allocPrint(allocator, "{s}", .{rel}) catch null;
+}
+
+/// Controllers enabled for children in `base`. Returns the names, space separated
+/// as they appear in cgroup.subtree_control.
+fn readControllers(path: []const u8, buf: []u8) ?[]const u8 {
+    const n = readFile(path, buf) catch return null;
+    const data = std.mem.trim(u8, buf[0..n], " \t\n\r");
+    return allocator.dupe(u8, data) catch null;
+}
+
+/// Controllers we need enabled in the leaf cgroup.
+const WantedControllers = struct {
+    names: [8][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *WantedControllers, name: []const u8) void {
+        for (self.names[0..self.len]) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        if (self.len == self.names.len) return;
+        self.names[self.len] = name;
+        self.len += 1;
+    }
+};
+
+/// Create poof's cgroup under the closest ancestor of our own cgroup that allows it.
+///
+/// Three kernel rules make this fiddly for an unprivileged poof:
+///   * a cgroup that has processes attached cannot enable controllers for its
+///     children, so inside a systemd scope the leaf has to go one level up;
+///   * the leaf must have the *same* controllers enabled as the cgroup the process
+///     is moved out of, otherwise writing cgroup.procs fails with EOPNOTSUPP;
+///   * only the root cgroup is exempt from the first rule, which is why the old
+///     top-level placement only ever worked for root and inside containers.
+///
+/// So each candidate is attempted end to end (enable controllers, mkdir, set
+/// limits, attach) and we move one level up whenever any step is refused.
+fn setupSandboxCgroup(config: Config, suffix: []const u8) ?[]const u8 {
+    var ctrl_buf: [512]u8 = undefined;
+
+    // Controllers we must enable in the leaf: the ones the caller asked for, plus
+    // every controller already active on our own cgroup (migration set match).
+    var wanted = WantedControllers{};
+    if (config.memory_limit != null) wanted.add("memory");
+    if (config.pids_limit != null) wanted.add("pids");
+    if (getMyCgroupRel()) |my_rel| {
+        var own_buf: [512]u8 = undefined;
+        const own_path = std.fmt.bufPrint(&own_buf, "/sys/fs/cgroup{s}/cgroup.controllers", .{my_rel}) catch null;
+        if (own_path) |p| {
+            if (readControllers(p, &ctrl_buf)) |list| {
+                var it = std.mem.tokenizeScalar(u8, list, ' ');
+                while (it.next()) |name| wanted.add(name);
+            }
+        }
+    }
+
+    var rel: []const u8 = getMyCgroupRel() orelse "";
+
+    while (true) {
+        var base_buf: [1024]u8 = undefined;
+        const base = std.fmt.bufPrint(&base_buf, "/sys/fs/cgroup{s}", .{rel}) catch return null;
+
+        var ok = true;
+        var sub_buf: [1100]u8 = undefined;
+        const sub_path = std.fmt.bufPrint(&sub_buf, "{s}/cgroup.subtree_control", .{base}) catch return null;
+
+        // The root cgroup already has its controllers wired up and is exempt from
+        // the no-internal-processes rule, so don't touch it unless we have to.
+        if (rel.len > 0) {
+            for (wanted.names[0..wanted.len]) |name| {
+                var w_buf: [64]u8 = undefined;
+                const plus = std.fmt.bufPrint(&w_buf, "+{s}", .{name}) catch {
+                    ok = false;
+                    break;
+                };
+                writeFile(sub_path, plus) catch |e| {
+                    vstep("cannot enable {s} controller in {s}: {}", .{ name, base, e });
+                    ok = false;
+                    break;
+                };
+            }
+        }
+
+        if (ok) {
+            var leaf_buf: [1100]u8 = undefined;
+            const leaf = std.fmt.bufPrint(&leaf_buf, "{s}/poof-{s}", .{ base, suffix }) catch return null;
+            makeDirPath(leaf) catch |e| {
+                vstep("cannot create cgroup under {s}: {}", .{ base, e });
+                ok = false;
+            };
+
+            if (ok) {
+                ok = writeCgroupLimits(leaf, config);
+                // The sandbox attaches itself to the leaf (attachToCgroup, called in
+                // the forked child); poof's own process deliberately stays outside so
+                // an OOM kill cannot take down the process that cleans up afterwards.
+                if (ok) return allocator.dupe(u8, leaf) catch return null;
+
+                // Roll back the empty leaf before trying the next ancestor.
+                deleteDirPath(leaf) catch {};
+            }
+        }
+
+        if (rel.len == 0) return null; // tried the root cgroup already
+        const cut = std.mem.lastIndexOfScalar(u8, rel, '/') orelse return null;
+        rel = rel[0..cut]; // one level up
+    }
+}
+
+fn writeCgroupLimits(leaf: []const u8, config: Config) bool {
+    var buf: [64]u8 = undefined;
+
+    // Set memory limit
+    if (config.memory_limit) |mem| {
+        const path = std.fmt.allocPrint(allocator, "{s}/memory.max", .{leaf}) catch return false;
+        const content = std.fmt.bufPrint(&buf, "{d}", .{mem}) catch return false;
+        writeFile(path, content) catch |e| {
+            log("failed to set memory limit: {}", .{e});
+            return false;
+        };
+        log("cgroup memory.max={d}", .{mem});
+
+        // memory.max alone is not a cap: with swap available the kernel just pages
+        // the excess out instead of enforcing the limit, so pin swap to zero.
+        const swap_path = std.fmt.allocPrint(allocator, "{s}/memory.swap.max", .{leaf}) catch null;
+        if (swap_path) |sp| {
+            writeFile(sp, "0") catch |e| {
+                vstep("cannot disable swap for the sandbox: {}", .{e});
+            };
+        }
+
+        // Kill the whole sandbox on OOM rather than letting it limp on.
+        const oom_path = std.fmt.allocPrint(allocator, "{s}/memory.oom.group", .{leaf}) catch null;
+        if (oom_path) |op| {
+            writeFile(op, "1") catch |e| {
+                vstep("cannot set memory.oom.group: {}", .{e});
+            };
+        }
+    }
+
+    // Set pids limit
+    if (config.pids_limit) |pids| {
+        const path = std.fmt.allocPrint(allocator, "{s}/pids.max", .{leaf}) catch return false;
+        const content = std.fmt.bufPrint(&buf, "{d}", .{pids}) catch return false;
+        writeFile(path, content) catch |e| {
+            log("failed to set pids limit: {}", .{e});
+            return false;
+        };
+        log("cgroup pids.max={d}", .{pids});
+    }
+
+    return true;
+}
+
 pub fn setupCgroup(config: Config) !void {
     // Check if cgroups v2 is available
     if (!pathExists("/sys/fs/cgroup/cgroup.controllers")) {
@@ -369,41 +581,26 @@ pub fn setupCgroup(config: Config) !void {
     randomBytes(&rand_buf);
     var suffix: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&suffix, "{x:0>16}", .{std.mem.readInt(u64, &rand_buf, .little)}) catch unreachable;
-    cgroup_path = try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/poof-{s}", .{suffix});
 
-    makeDirPath(cgroup_path.?) catch |e| {
-        log("failed to create cgroup: {}", .{e});
-        return e;
-    };
-
-    var buf: [64]u8 = undefined;
-
-    // Set memory limit
-    if (config.memory_limit) |mem| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/memory.max", .{cgroup_path.?});
-        const content = try std.fmt.bufPrint(&buf, "{d}", .{mem});
-        writeFile(path, content) catch |e| {
-            log("failed to set memory limit: {}", .{e});
-        };
-        log("cgroup memory.max={d}", .{mem});
-    }
-
-    // Set pids limit
-    if (config.pids_limit) |pids| {
-        const path = try std.fmt.allocPrint(allocator, "{s}/pids.max", .{cgroup_path.?});
-        const content = try std.fmt.bufPrint(&buf, "{d}", .{pids});
-        writeFile(path, content) catch |e| {
-            log("failed to set pids limit: {}", .{e});
-        };
-        log("cgroup pids.max={d}", .{pids});
-    }
-
-    // Move current process into cgroup
-    const procs_path = try std.fmt.allocPrint(allocator, "{s}/cgroup.procs", .{cgroup_path.?});
-    const pid_content = try std.fmt.bufPrint(&buf, "{d}", .{linux.getpid()});
-    try writeFile(procs_path, pid_content);
+    cgroup_path = setupSandboxCgroup(config, &suffix) orelse return error.CgroupsNotAvailable;
 
     log("cgroup created: {s}", .{cgroup_path.?});
+}
+
+/// Move the calling process (the sandbox) into the limits cgroup that setupCgroup
+/// prepared. Called from the forked child, before it does anything else, so the
+/// whole sandbox tree is covered while poof's parent stays outside the cgroup.
+pub fn attachToCgroup() !void {
+    const path = cgroup_path orelse return;
+    var procs_buf: [1200]u8 = undefined;
+    var pid_buf: [32]u8 = undefined;
+    const procs_path = std.fmt.bufPrint(&procs_buf, "{s}/cgroup.procs", .{path}) catch return error.Unexpected;
+    const pid_str = std.fmt.bufPrint(&pid_buf, "{d}", .{linux.getpid()}) catch return error.Unexpected;
+    writeFile(procs_path, pid_str) catch |e| {
+        err("cannot move sandbox into cgroup {s}: {}", .{ path, e });
+        return e;
+    };
+    log("sandbox attached to cgroup {s}", .{path});
 }
 
 pub fn cleanupCgroup() void {
@@ -415,8 +612,20 @@ pub fn cleanupCgroup() void {
             writeFile(orig, pid_str) catch {};
         }
 
-        // Now remove the empty cgroup
-        deleteDirPath(path) catch {};
+        // Now remove the empty cgroup. The last process out (typically the
+        // fuse-overlayfs daemon) may still be in the middle of leaving, which makes
+        // rmdir fail with ENOTEMPTY, so retry briefly instead of leaking the cgroup.
+        var attempt: usize = 0;
+        while (attempt < 20) : (attempt += 1) {
+            deleteDirPath(path) catch |e| switch (e) {
+                error.DirNotEmpty, error.Unexpected, error.PermissionDenied => {
+                    sleepNs(0, 50_000_000);
+                    continue;
+                },
+                else => break,
+            };
+            break;
+        }
     }
 }
 
@@ -454,8 +663,8 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
 
     // Fork and exec fuse-overlayfs in foreground mode (-f)
     // This keeps the FUSE daemon running as a child process
-    const pid = linux.fork();
-    if (pid == 0) {
+    const forked = forkChild();
+    if (forked.pid == 0) {
         // Child - exec fuse-overlayfs in foreground
         // PDEATHSIG survives execve, so the daemon goes away together with the
         // sandboxed process instead of lingering with the FUSE connection and our
@@ -471,17 +680,17 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
         };
         _ = linux.execve("/usr/bin/fuse-overlayfs", &argv, @ptrCast(std.c.environ));
         std.process.exit(127); // exec failed
-    } else if (pid > 0) {
+    } else if (forked.pid > 0) {
         // Parent - save PID for cleanup, wait briefly for mount
-        fuse_overlay_pid = @intCast(pid);
+        fuse_overlay_pid = forked.pid;
 
         // Give fuse-overlayfs time to set up the mount
         sleepNs(0, 100_000_000); // 100ms
 
         // Check if child exited (indicates failure - it should stay running)
         var status: i32 = 0;
-        const wait_result = linux.waitpid(@intCast(pid), &status, linux.W.NOHANG);
-        if (wait_result > 0) {
+        const wait_result = linux.waitpid(forked.pid, &status, linux.W.NOHANG);
+        if (errnoFromSyscall(wait_result) == .SUCCESS and wait_result > 0) {
             // Child exited - something went wrong
             fuse_overlay_pid = null;
             const us: u32 = @bitCast(status);
@@ -637,8 +846,18 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         // cleanup_work_dir and cleanup_merged_base are set by parent before fork
     }
 
-    // Create directories
-    inline for (.{ upper_dir, work_dir, merged_dir }) |dir| {
+    // Create the upper directory (and any missing parents), then check it really
+    // is a directory: otherwise fuse-overlayfs fails with an unrelated error.
+    makeDirs(upper_dir) catch |e| {
+        err("mkdir {s}: {}", .{ upper_dir, e });
+        return .{ .err = .ACCES };
+    };
+    if (!isDirectory(upper_dir)) {
+        err("upper path is not a directory: {s}", .{upper_dir});
+        return .{ .err = .NOTDIR };
+    }
+
+    inline for (.{ work_dir, merged_dir }) |dir| {
         makeDirPath(dir) catch |e| {
             if (e != error.PathAlreadyExists) {
                 err("mkdir {s}: {}", .{ dir, e });
@@ -660,6 +879,48 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     // Mount overlay
     const merged_z = allocator.dupeSentinel(u8, merged_dir, 0) catch return .{ .err = .NOMEM };
 
+    // fuse-overlayfs refuses to read a directory that contains its own upperdir or
+    // workdir (readdir fails with EIO), and with lowerdir=/ those always sit inside the
+    // tree the sandbox walks - so `ls` in the directory holding --upper would break.
+    // Kernel overlayfs hides upper/work from the merged view; emulate that here: hand
+    // fuse a bind of upper's *parent* (upper and work must stay on one mount, or
+    // copy-up's rename gets EXDEV) and shadow the originals with an empty bind.
+    var fuse_upper = upper_dir;
+    var fuse_work = work_dir;
+    if (!use_kernel_overlay and config.mode != .exec) {
+        const store_dir = std.fmt.allocPrint(allocator, "{s}/store", .{temp_base}) catch return .{ .err = .NOMEM };
+        const empty_dir = std.fmt.allocPrint(allocator, "{s}/empty", .{temp_base}) catch return .{ .err = .NOMEM };
+        makeDirPath(store_dir) catch |e| {
+            if (e != error.PathAlreadyExists) return .{ .err = .ACCES };
+        };
+        makeDirPath(empty_dir) catch |e| {
+            if (e != error.PathAlreadyExists) return .{ .err = .ACCES };
+        };
+
+        const upper_parent = std.fs.path.dirname(upper_dir) orelse "/";
+        const work_parent = std.fs.path.dirname(work_dir) orelse "/";
+        if (std.mem.eql(u8, upper_parent, work_parent)) {
+            const store_z = allocator.dupeSentinel(u8, store_dir, 0) catch return .{ .err = .NOMEM };
+            const empty_z = allocator.dupeSentinel(u8, empty_dir, 0) catch return .{ .err = .NOMEM };
+            const upper_z = allocator.dupeSentinel(u8, upper_dir, 0) catch return .{ .err = .NOMEM };
+            const work_z = allocator.dupeSentinel(u8, work_dir, 0) catch return .{ .err = .NOMEM };
+            const parent_z = allocator.dupeSentinel(u8, upper_parent, 0) catch return .{ .err = .NOMEM };
+
+            switch (mount(parent_z.ptr, store_z.ptr, "none", linux.MS.BIND, null)) {
+                .ok => {
+                    _ = mount(empty_z.ptr, upper_z.ptr, "none", linux.MS.BIND, null);
+                    _ = mount(empty_z.ptr, work_z.ptr, "none", linux.MS.BIND, null);
+                    fuse_upper = std.fmt.allocPrint(allocator, "{s}/{s}", .{ store_dir, std.fs.path.basename(upper_dir) }) catch return .{ .err = .NOMEM };
+                    fuse_work = std.fmt.allocPrint(allocator, "{s}/{s}", .{ store_dir, std.fs.path.basename(work_dir) }) catch return .{ .err = .NOMEM };
+                    log("upper/work hidden from sandbox view (fuse)", .{});
+                },
+                // A mount root (e.g. --upper=/somewhere) cannot be bind mounted from
+                // inside a user namespace; fall back to the original layout.
+                .err => |e| log("cannot bind {s}: {} - keeping original layout", .{ upper_parent, e }),
+            }
+        }
+    }
+
     if (use_kernel_overlay) {
         // Use kernel overlayfs (requires CAP_SYS_ADMIN)
         const opts_str = std.fmt.allocPrint(allocator, "lowerdir=/,upperdir={s},workdir={s}", .{ upper_dir, work_dir }) catch return .{ .err = .NOMEM };
@@ -680,7 +941,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         log("overlay mounted (kernel)", .{});
     } else {
         // Use fuse-overlayfs for non-root (with squash_to_root)
-        mountFuseOverlay("/", upper_dir, work_dir, merged_dir) catch |e| {
+        mountFuseOverlay("/", fuse_upper, fuse_work, merged_dir) catch |e| {
             switch (e) {
                 error.FuseOverlayfsNotFound => {
                     err("fuse-overlayfs not found", .{});
@@ -693,6 +954,9 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
                 error.MountVerifyFailed => {
                     err("fuse-overlayfs mount failed (empty merged directory)", .{});
                     err("check permissions and /dev/fuse availability", .{});
+                },
+                error.ForkFailed => {
+                    err("cannot start fuse-overlayfs: no process slots left (--pids is too small)", .{});
                 },
                 else => {
                     err("fuse-overlayfs failed: {}", .{e});
@@ -808,6 +1072,12 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     // Set up death signal - if parent dies, we get SIGKILL
     _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(usize, @backingInt(linux.SIG.KILL)), 0, 0, 0);
 
+    // Join the resource-limit cgroup before unsharing anything: the cgroup files are
+    // owned by the real uid, and everything forked below inherits the membership.
+    if (cgroup_path != null) {
+        attachToCgroup() catch std.process.exit(1);
+    }
+
     const is_root = orig_uid == 0;
 
     // Unshare namespaces: mount, PID, UTS, IPC
@@ -846,20 +1116,33 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
         };
     }
 
-    // Fork again to enter the new PID namespace (we become PID 1)
-    const pid = linux.fork();
-    if (pid != 0) {
+    // Fork again to enter the new PID namespace (the child becomes PID 1)
+    const forked = forkChild();
+    if (forked.pid != 0) {
         // Parent waits for child and exits with its status
-        if (pid > 0) {
+        if (forked.pid > 0) {
+            // Forward interrupts to the namespace instead of dying here: the sandbox
+            // tears itself down once the command is gone, which keeps the mount and
+            // PID namespaces from being torn out from under a running command.
+            forward_to_pid = forked.pid;
+            installSignalForwarding();
+
             var status: i32 = 0;
-            _ = linux.waitpid(@intCast(pid), &status, 0);
+            while (true) {
+                const r = linux.waitpid(forked.pid, &status, 0);
+                if (errnoFromSyscall(r) != .SUCCESS) continue; // EINTR from a forwarded signal
+                break;
+            }
             const us: u32 = @bitCast(status);
             if ((us & 0x7f) == 0) {
                 std.process.exit(@truncate((us >> 8) & 0xff));
             }
-            std.process.exit(1);
+            std.process.exit(128 + @as(u8, @truncate(us & 0x7f)));
         } else {
-            err("fork failed", .{});
+            err("fork failed: {}", .{forked.errno});
+            if (forked.errno == .AGAIN) {
+                err("not enough processes allowed to start the sandbox (--pids is too small)", .{});
+            }
             std.process.exit(1);
         }
     }
@@ -900,9 +1183,74 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
         }).ptr;
     }
 
-    // execvp resolves argv[0] via PATH and inherits the current environ
-    // (which already has IS_SANDBOX=1 set above).
-    _ = execvp(argv[0].?, argv.ptr);
-    err("exec failed: {s}: {}", .{ config.command[0], c.errno(-1) });
-    std.process.exit(127);
+    // Run the command as a child of this namespace's init rather than *as* it. The
+    // kernel discards unhandled terminating signals for a pid namespace's PID 1 (only
+    // SIGKILL reaches it) and swallows crash signals outright, so a command running as
+    // PID 1 cannot be stopped with SIGTERM/SIGINT and a segfault turns into a clean
+    // exit 0. This process is the tiny init: it forwards signals to the command and
+    // reports its real status (128+signum when killed by a signal).
+    forward_to_pid = 0;
+    installSignalForwarding();
+
+    const cmd_pid = forkChild();
+    if (cmd_pid.pid == 0) {
+        // execvp resolves argv[0] via PATH and inherits the current environ
+        // (which already has IS_SANDBOX=1 set above).
+        _ = execvp(argv[0].?, argv.ptr);
+        const exec_errno = c.errno(-1);
+        switch (exec_errno) {
+            .ACCES => {
+                err("cannot execute {s}: permission denied", .{config.command[0]});
+                std.process.exit(126); // shell convention: found but not executable
+            },
+            .NOENT => {
+                err("command not found: {s}", .{config.command[0]});
+                std.process.exit(127);
+            },
+            else => {
+                err("exec failed: {s}: {s}", .{ config.command[0], @tagName(exec_errno) });
+                std.process.exit(127);
+            },
+        }
+    }
+    if (cmd_pid.pid < 0) {
+        err("fork failed: {}", .{cmd_pid.errno});
+        if (cmd_pid.errno == .AGAIN) {
+            err("not enough processes allowed to run the command (--pids is too small)", .{});
+        }
+        std.process.exit(1);
+    }
+    forward_to_pid = cmd_pid.pid;
+
+    var status: i32 = 0;
+    while (true) {
+        const r = linux.waitpid(cmd_pid.pid, &status, 0);
+        if (errnoFromSyscall(r) != .SUCCESS) continue; // EINTR from a forwarded signal
+        break;
+    }
+    const us: u32 = @bitCast(status);
+    if (linux.W.IFSIGNALED(us)) {
+        std.process.exit(128 + @as(u8, @truncate(us & 0x7f)));
+    }
+    std.process.exit(@truncate((us >> 8) & 0xff));
+}
+
+// Signal forwarding down the sandbox chain: poof's parent -> namespace parent ->
+// namespace init -> command. Each hop only knows its own child.
+var forward_to_pid: i32 = 0;
+
+fn forwardSignal(sig: linux.SIG) callconv(.c) void {
+    if (forward_to_pid > 0) _ = linux.kill(forward_to_pid, sig);
+}
+
+fn installSignalForwarding() void {
+    var action: linux.Sigaction = .{
+        .handler = .{ .handler = forwardSignal },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = linux.sigaction(linux.SIG.INT, &action, null);
+    _ = linux.sigaction(linux.SIG.TERM, &action, null);
+    _ = linux.sigaction(linux.SIG.HUP, &action, null);
+    _ = linux.sigaction(linux.SIG.QUIT, &action, null);
 }

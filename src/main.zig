@@ -88,6 +88,11 @@ extern "c" fn getpgrp() c_int;
 // Signal handler state
 var child_pid: i32 = 0;
 
+// Set before fork when an interactive run/enter session is active. An abnormal
+// exit (timeout or signal) must stash the changes instead of deleting them.
+var interactive_upper: ?[]const u8 = null;
+var interactive_changes_path: ?[]const u8 = null;
+
 fn signalHandler(sig: linux.SIG) callconv(.c) void {
     // Forward signal to child and wait for it to exit
     if (child_pid > 0) {
@@ -96,6 +101,8 @@ fn signalHandler(sig: linux.SIG) callconv(.c) void {
         var status: i32 = 0;
         _ = linux.waitpid(child_pid, &status, 0);
     }
+    // Don't destroy an interrupted session's work: stash it and say where.
+    stashInteractiveChanges();
     // Cleanup cgroups and temp dirs
     sandbox.cleanupCgroup();
     sandbox.cleanupOverlayDirs();
@@ -345,6 +352,21 @@ fn handleEnterModeChanges(config: Config) void {
     }
 }
 
+// True when a directory exists and holds at least one entry.
+fn hasDirEntries(path: []const u8) bool {
+    var dir = sandbox.DirStream.open(path) orelse return false;
+    defer dir.close();
+    return dir.next() != null;
+}
+
+// An interactive session that was killed (timeout/signal) never got to prompt,
+// so keep its upper dir and tell the user where to find it.
+fn stashInteractiveChanges() void {
+    const upper_dir = interactive_upper orelse return;
+    const changes_path = interactive_changes_path orelse return;
+    if (hasDirEntries(changes_path)) keepChanges(upper_dir);
+}
+
 fn keepChanges(upper_dir: []const u8) void {
     // Don't delete the temp dir - user wants to keep it
     sandbox.cleanup_temp_base = null;
@@ -391,7 +413,12 @@ pub fn run(config: Config) u8 {
     // Set up cgroups BEFORE fork so child inherits limits
     if (config.memory_limit != null or config.pids_limit != null) {
         sandbox.setupCgroup(config) catch |cgroup_err| {
-            err("cgroup setup failed: {}", .{cgroup_err});
+            if (cgroup_err == error.CgroupsNotAvailable) {
+                err("cannot apply --memory/--pids: no place in the cgroup hierarchy allows creating a limited child cgroup", .{});
+                info("try running as root, or check the cgroup delegation of your session (systemd) / container", .{});
+            } else {
+                err("cgroup setup failed: {}", .{cgroup_err});
+            }
             return 1;
         };
         vstep("Resource limits applied", .{});
@@ -419,18 +446,28 @@ pub fn run(config: Config) u8 {
         }
     }
 
+    // Remember what an abnormal exit must stash (interactive run/enter only)
+    if (config.enter_target != null) {
+        interactive_upper = config.upper_dir;
+        interactive_changes_path = std.fmt.allocPrint(
+            allocator,
+            "{s}{s}",
+            .{ config.upper_dir.?, config.enter_target.? },
+        ) catch null;
+    }
+
     // Set up signal handlers BEFORE fork for cleanup on SIGTERM/SIGINT
     setupSignalHandlers();
 
     // Fork to create isolated child
-    const pid = linux.fork();
+    const forked = sandbox.forkChild();
 
-    if (pid == 0) {
+    if (forked.pid == 0) {
         // Child
         sandbox.childMain(config, orig_uid, orig_gid);
-    } else if (pid > 0) {
+    } else if (forked.pid > 0) {
         // Parent - wait for child with optional timeout
-        child_pid = @intCast(pid);
+        child_pid = forked.pid;
         log("child pid={}", .{child_pid});
 
         if (config.timeout) |timeout_secs| {
@@ -461,6 +498,7 @@ pub fn run(config: Config) u8 {
                     warn("timeout after {d}s, killing process", .{timeout_secs});
                     _ = linux.kill(child_pid, linux.SIG.KILL);
                     _ = waitChild(child_pid, 0);
+                    stashInteractiveChanges();
                     sandbox.cleanupCgroup();
                     sandbox.cleanupOverlayDirs();
                     return 124; // Standard timeout exit code
@@ -484,7 +522,7 @@ pub fn run(config: Config) u8 {
             return exitCodeFromStatus(result.status);
         }
     } else {
-        err("fork failed: {}", .{sandbox.errnoFromSyscall(pid)});
+        err("fork failed: {}", .{forked.errno});
         sandbox.cleanupCgroup();
         sandbox.cleanupOverlayDirs();
         return 1;
@@ -566,7 +604,12 @@ fn printModeHelp(mode: sandbox.Mode) void {
             print("\n{s}EXAMPLES{s}\n", .{ B, R });
             print("  {s}${s} poof enter                        {s}# Sandbox current dir{s}\n", .{ D, R, D, R });
             print("  {s}${s} poof enter /etc                   {s}# Sandbox /etc{s}\n", .{ D, R, D, R });
-            print("  {s}${s} cd myproject && poof enter        {s}# Edit safely{s}\n\n", .{ D, R, D, R });
+            print("  {s}${s} cd myproject && poof enter        {s}# Edit safely{s}\n", .{ D, R, D, R });
+            print("\n{s}OPTIONS{s}\n", .{ B, R });
+            print("  {s}-v, --verbose{s}       Show detailed progress\n", .{ G, R });
+            print("  {s}--timeout=<secs>{s}    Kill after N seconds\n", .{ G, R });
+            print("  {s}--memory=<size>{s}     Memory limit (e.g. 100M, 1G)\n", .{ G, R });
+            print("  {s}--pids=<max>{s}        Max processes\n\n", .{ G, R });
         },
     }
 }
@@ -671,30 +714,56 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            printUsage();
+            // Help is the requested result, so it goes to stdout (exit 0).
+            output.routeToStdout(true);
+            if (mode) |m| printModeHelp(m) else printUsage();
+            output.routeToStdout(false);
             return 0;
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            output.routeToStdout(true);
             printVersion();
+            output.routeToStdout(false);
             return 0;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             output.setVerbose(true);
         } else if (std.mem.startsWith(u8, arg, "--upper=")) {
             upper_dir = arg[8..];
         } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
-            config.timeout = std.fmt.parseInt(u32, arg[10..], 10) catch {
+            const secs = std.fmt.parseInt(u32, arg[10..], 10) catch {
                 err("invalid timeout: {s}", .{arg[10..]});
                 return 1;
             };
+            if (secs == 0) {
+                err("invalid timeout: 0 (use --timeout=<secs> with secs > 0)", .{});
+                return 1;
+            }
+            config.timeout = secs;
         } else if (std.mem.startsWith(u8, arg, "--memory=")) {
-            config.memory_limit = parseSize(arg[9..]) catch {
+            const bytes = parseSize(arg[9..]) catch {
                 err("invalid memory limit: {s} (use e.g. 100M, 1G)", .{arg[9..]});
                 return 1;
             };
+            if (bytes == 0) {
+                err("invalid memory limit: 0 (use --memory=<size> with size > 0)", .{});
+                return 1;
+            }
+            config.memory_limit = bytes;
         } else if (std.mem.startsWith(u8, arg, "--pids=")) {
-            config.pids_limit = std.fmt.parseInt(u32, arg[7..], 10) catch {
+            const max = std.fmt.parseInt(u32, arg[7..], 10) catch {
                 err("invalid pids limit: {s}", .{arg[7..]});
                 return 1;
             };
+            if (max == 0) {
+                err("invalid pids limit: 0 (must be at least 1)", .{});
+                return 1;
+            }
+            if (max < 2) {
+                // The sandbox always needs more than one process in the cgroup:
+                // the namespace init plus the command it runs.
+                err("invalid pids limit: {d} (the sandbox needs at least 2 processes)", .{max});
+                return 1;
+            }
+            config.pids_limit = max;
         } else if (std.mem.eql(u8, arg, "--")) {
             cmd_start = i + 1;
             break;
@@ -741,6 +810,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     config.mode = mode.?;
     config.verbose = output.isVerbose();
 
+    // --upper only means anything for run mode; say so instead of dropping it.
+    if (upper_dir != null and config.mode != .run) {
+        warn("--upper is only used by run mode; ignored for {s} mode", .{@tagName(config.mode)});
+    }
+
     // Handle enter mode specially - uses $SHELL, no command needed
     if (config.mode == .enter) {
         const shell = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else "/bin/sh";
@@ -750,7 +824,34 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         };
         shell_args[0] = shell;
         config.command = shell_args;
-        config.enter_target = cwd;
+
+        // `poof enter <directory>` — sandbox that directory instead of the cwd.
+        var target = cwd;
+        if (cmd_start < args.len) {
+            if (cmd_start + 1 < args.len) {
+                err("enter takes at most one directory, got extra argument: {s}", .{args[cmd_start + 1]});
+                return 1;
+            }
+            const arg_dir = args[cmd_start];
+            target = if (arg_dir.len > 0 and arg_dir[0] == '/')
+                arg_dir
+            else if (std.mem.eql(u8, cwd, "/"))
+                std.fmt.allocPrint(allocator, "/{s}", .{arg_dir}) catch {
+                    err("out of memory", .{});
+                    return 1;
+                }
+            else
+                std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg_dir }) catch {
+                    err("out of memory", .{});
+                    return 1;
+                };
+            if (!sandbox.isDirectory(target)) {
+                err("not a directory: {s}", .{target});
+                return 1;
+            }
+        }
+        config.enter_target = target;
+        config.cwd = target;
 
         // Create temp upper dir for enter mode
         config.upper_dir = sandbox.makeTempDir() catch {

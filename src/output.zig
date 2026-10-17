@@ -50,11 +50,11 @@ pub fn isVerbose() bool {
     return verbose_mode;
 }
 
-fn writeStderr(data: []const u8) void {
+fn writeFd(fd: posix.fd_t, data: []const u8) void {
     var remaining = data;
     while (remaining.len > 0) {
         // posix.write moved behind std.Io in 0.17; use the raw syscall.
-        const written = linux.write(posix.STDERR_FILENO, remaining.ptr, remaining.len);
+        const written = linux.write(fd, remaining.ptr, remaining.len);
         const signed: isize = @bitCast(written);
         if (signed < 0) return; // write error or interrupted
         if (written == 0) return;
@@ -62,10 +62,19 @@ fn writeStderr(data: []const u8) void {
     }
 }
 
+// Status output goes to stderr so it never mixes with the sandboxed command's
+// own stdout. Help and version text are the exception: they are the requested
+// result, so they go to stdout and can be piped.
+var print_fd: posix.fd_t = posix.STDERR_FILENO;
+
+pub fn routeToStdout(on: bool) void {
+    print_fd = if (on) posix.STDOUT_FILENO else posix.STDERR_FILENO;
+}
+
 fn printFmt(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    writeStderr(s);
+    writeFd(print_fd, s);
 }
 
 pub fn col(color: []const u8) []const u8 {
