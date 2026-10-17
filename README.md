@@ -83,9 +83,13 @@ Requires [Zig](https://ziglang.org/) 0.17+ and Linux:
 ```bash
 git clone https://github.com/jarred-sumner/poof
 cd poof
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Dgit-commit=$(git rev-parse --short HEAD)
 sudo cp zig-out/bin/poof /usr/local/bin/
 ```
+
+`-Dgit-commit` is worth passing: Zig caches the configure step, so the commit poof
+looks up by itself is pinned to the last configure of `build.zig` and can lag behind
+`HEAD`. Without the flag, `poof --version` labels that value "from last configure".
 
 ---
 
@@ -158,6 +162,7 @@ poof apply /tmp/poof-4f2a9c1b7d3e8a55
 
 poof apply /tmp/poof-4f2a9c1b7d3e8a55 --yes   # no prompt, for scripts
 poof run --apply=/tmp/poof-4f2a9c1b7d3e8a55 --yes
+# a stash that applies in full is removed; a partial failure keeps it for a retry
 ```
 
 Because a stash mirrors absolute paths, `<stash>/home/me/proj/x.c` applies to
@@ -622,7 +627,9 @@ OPTIONS
   -h, --help                 Show this help
 ```
 
-The stash is kept after applying: remove it yourself once you are done.
+A stash that applies in full is removed; one that hits any failure is kept so the
+failures can be fixed and the same stash applied again. A stash that is the current
+directory is applied but left in place rather than deleted under you.
 A stash you chose with `--upper=<dir>` is applied by path — only poof's own
 `/tmp/poof-<hex>` upper dirs are listed by `poof stash list`.
 

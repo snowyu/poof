@@ -1367,6 +1367,117 @@ describe("poof CLI", () => {
       expect(out).not.toContain(".wh.");
     });
 
+    // --- regressions for defects found while building `apply` ---------------
+
+    test("a .wh.<name> regular file deletes the target instead of being copied", () => {
+      // The other whiteout form: fuse-overlayfs and other userspace drivers write
+      // ".wh.<name>" as a regular file. It used to be copied onto the target, so
+      // the deletion turned into overwriting the file with the marker's contents.
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, ".wh.gone.txt"), "marker contents");
+      writeFileSync(join(targetDir, "gone.txt"), "real contents\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(join(targetDir, "gone.txt"))).toBe(false);
+      expect(existsSync(join(targetDir, ".wh.gone.txt"))).toBe(false);
+    });
+
+    test("applying a deletion never follows a symlink out of the target tree", () => {
+      const outside = join(TEST_DIR, "outside-the-target-tree.txt");
+      writeFileSync(outside, "do not touch\n");
+      symlinkSync(outside, join(targetDir, "link")); // the target holds an escaping symlink
+
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, ".wh.link"), "");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(join(targetDir, "link"))).toBe(false); // the link itself goes away
+      expect(readFileSync(outside, "utf8")).toBe("do not touch\n"); // not its target
+    });
+
+    test("an opaque marker at the stash root does not clear the host root", () => {
+      // An upper dir's own root marker must never be read as "replace /".
+      const sentinel = join(TEST_DIR, "sentinel-dir");
+      mkdirSync(sentinel);
+      writeFileSync(join(sentinel, "keep.txt"), "keep\n");
+
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(stashDir, ".wh..wh..opq"), "");
+      writeFileSync(join(mirrored, "added.txt"), "added\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(join(sentinel, "keep.txt"), "utf8")).toBe("keep\n");
+      expect(readFileSync(join(targetDir, "added.txt"), "utf8")).toBe("added\n");
+    });
+
+    test("an opaque directory replaces the target contents whatever order readdir gives", () => {
+      // The marker can arrive after the real entries; clearing the target must
+      // still happen before its contents are replayed.
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, ".wh..wh..opq"), "");
+      writeFileSync(join(mirrored, "new.txt"), "new\n");
+      writeFileSync(join(targetDir, "old.txt"), "old\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(join(targetDir, "old.txt"))).toBe(false);
+      expect(readFileSync(join(targetDir, "new.txt"), "utf8")).toBe("new\n");
+      expect(readdirSync(targetDir)).toEqual(["new.txt"]);
+    });
+
+    test("a non-regular file is neither a deletion nor copied, and the stash is kept", () => {
+      // A real device node needs CAP_MKNOD, which the sandbox does not have, so a
+      // fifo stands in for "some other file type": it must not be mistaken for a
+      // whiteout and must not be copied.
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      expect(spawnSync(["sh", "-c", `mkfifo ${join(mirrored, "pipe")}`]).exitCode).toBe(0);
+      writeFileSync(join(mirrored, ".wh.gone.txt"), "");
+      writeFileSync(join(targetDir, "gone.txt"), "x\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      const out = r.stdout.toString() + r.stderr.toString();
+      expect(out).toContain("skipping unsupported file type");
+      expect(out).toContain("stash kept in");
+      expect(r.exitCode).toBe(1);
+      expect(existsSync(stashDir)).toBe(true); // kept so the failure can be retried
+      expect(existsSync(join(targetDir, "gone.txt"))).toBe(false); // the deletion still landed
+    });
+
+    test("a fully applied stash is removed, along with an older stash's .work dir", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "f.txt"), "f\n");
+      mkdirSync(stashDir + ".work"); // left behind by poof before the work-dir fix
+      writeFileSync(join(stashDir + ".work", "stale"), "x");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stderr.toString()).toContain(`removed ${stashDir}`);
+      expect(existsSync(stashDir)).toBe(false);
+      expect(existsSync(stashDir + ".work")).toBe(false);
+      expect(readFileSync(join(targetDir, "f.txt"), "utf8")).toBe("f\n");
+    });
+
+    test("a stash that is the current directory is applied but kept", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "f.txt"), "f\n");
+
+      const r = spawnSync([POOF_BIN, "apply", ".", "--yes"], { cwd: stashDir });
+      expect(r.exitCode).toBe(0);
+      expect(r.stderr.toString()).toContain("leaving it in place");
+      expect(existsSync(stashDir)).toBe(true);
+      expect(readFileSync(join(targetDir, "f.txt"), "utf8")).toBe("f\n");
+    });
+
     test("an empty stash applies nothing", () => {
       const r = spawnSync([POOF_BIN, "apply", stashDir]);
       expect(r.stdout.toString() + r.stderr.toString()).toContain("no changes in");
@@ -1380,6 +1491,7 @@ describe("poof CLI", () => {
       const r = spawnSync([POOF_BIN, "run", `--apply=${stashDir}`, "--yes"]);
       expect(r.exitCode).toBe(0);
       expect(readFileSync(join(targetDir, "via-run.txt"), "utf8")).toBe("via run\n");
+      expect(existsSync(stashDir)).toBe(false);
     });
 
     test("apply --help goes to stdout", () => {
@@ -1431,6 +1543,7 @@ describe("poof CLI", () => {
       const r = spawnSync([POOF_BIN, "apply", stash!, "--yes"]);
       expect(r.exitCode).toBe(0);
       expect(existsSync(victim)).toBe(false);
+      expect(existsSync(stash!)).toBe(false); // applied in full: the stash is cleaned up
 
       cleanupStash(session.output);
       rmSync(dir, { recursive: true, force: true });

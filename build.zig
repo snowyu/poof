@@ -6,8 +6,13 @@ pub fn build(b: *std.Build) void {
 
     // Version from environment or default
     const version = b.option([]const u8, "version", "Version string") orelse "dev";
-    const git_commit = b.option([]const u8, "git-commit", "Git commit hash") orelse blk: {
-        // Try to get git commit at build time
+    // Zig caches the configure step, so a command run here is replayed until
+    // build.zig itself changes: the automatic lookup can lag behind HEAD. Release
+    // and CI builds pass -Dgit-commit explicitly, which is authoritative; when
+    // the value came from the lookup, poof --version says so instead of lying.
+    const git_commit_opt = b.option([]const u8, "git-commit", "Git commit hash (authoritative)");
+    const git_commit_explicit = git_commit_opt != null;
+    const git_commit = git_commit_opt orelse blk: {
         const result = b.runFallible(&.{ "git", "rev-parse", "--short", "HEAD" }, .{
             .stderr_behavior = .ignore,
         });
@@ -20,6 +25,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_commit", git_commit);
+    options.addOption(bool, "git_commit_explicit", git_commit_explicit);
 
     const exe = b.addExecutable(.{
         .name = "poof",

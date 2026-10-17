@@ -11,6 +11,7 @@ const sandbox = @import("sandbox.zig");
 // Version info (set at build time)
 const version = options.version;
 const git_commit = options.git_commit;
+const git_commit_explicit = options.git_commit_explicit;
 
 // Re-exports from modules
 const allocator = sandbox.allocator;
@@ -662,17 +663,41 @@ fn applyChanges(source: []const u8, target: []const u8) void {
 
 // A stash is an upper dir: its contents mirror absolute paths, so the target of
 // every entry is encoded in the path itself and no sidecar metadata is needed.
-fn resolveStash(input: []const u8, cwd: []const u8) ?[]const u8 {
-    var path = input;
-    while (path.len > 1 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
-    if (path.len == 0) return null;
+// Lexical path cleanup: std.fs.path.normalize is gone in this Zig release. Only
+// the simple form is needed here, so that `poof apply .` inside a stash names
+// the same directory as the same stash given by an absolute path.
+fn normalizePath(alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    var segments: [256][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (n == 0) return null; // would escape the root
+            n -= 1;
+            continue;
+        }
+        if (n >= segments.len) return null;
+        segments[n] = seg;
+        n += 1;
+    }
+    if (n == 0) return alloc.dupe(u8, "/") catch null;
+    const joined = std.mem.join(alloc, "/", segments[0..n]) catch return null;
+    if (path.len > 0 and path[0] == '/') return std.fmt.allocPrint(alloc, "/{s}", .{joined}) catch null;
+    return joined;
+}
 
-    const abs = if (path[0] == '/')
-        path
-    else if (std.mem.eql(u8, cwd, "/"))
-        std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return null
+fn resolveStash(input: []const u8, cwd: []const u8) ?[]const u8 {
+    if (input.len == 0) return null;
+
+    const joined = if (input[0] == '/')
+        input
     else
-        std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path }) catch return null;
+        std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, input }) catch return null;
+
+    // Normalized, so `poof apply .` inside a stash names the same directory as
+    // an absolute path would (removeStash compares against the cwd).
+    const abs = normalizePath(allocator, joined) orelse return null;
 
     if (std.mem.eql(u8, abs, "/")) {
         err("refusing to treat / as a stash", .{});
@@ -731,11 +756,40 @@ fn applyStash(input: []const u8, cwd: []const u8, assume_yes: bool) u8 {
 
     if (stats.failed != 0) {
         err("applied {d} change(s), {d} failed", .{ stats.applied, stats.failed });
+        info("stash kept in {s}; fix what failed and apply it again", .{stash});
         return 1;
     }
-    success("Applied {d} change(s) from {s}", .{ stats.applied, stash });
-    log("stash kept in {s}; remove it when you are done", .{stash});
+
+    // Fully applied: the upper dir has served its purpose and would otherwise
+    // pile up in /tmp. Anything that failed above keeps the stash for a retry.
+    if (removeStash(stash, cwd)) {
+        success("Applied {d} change(s) and removed {s}", .{ stats.applied, stash });
+    } else {
+        success("Applied {d} change(s) from {s}", .{ stats.applied, stash });
+    }
     return 0;
+}
+
+// Delete a stash that has been applied. Returns false when it was left in place
+// on purpose. The stash is the upper dir; stashes saved by older poof versions
+// also left the overlay work dir beside it, which is dead weight once unmounted.
+fn removeStash(stash: []const u8, cwd: []const u8) bool {
+    if (std.mem.eql(u8, stash, "/")) return false;
+    if (std.mem.eql(u8, stash, cwd)) {
+        warn("stash is the current directory; leaving it in place: {s}", .{stash});
+        return false;
+    }
+
+    sandbox.deleteTree(stash);
+
+    const work = std.fmt.allocPrint(allocator, "{s}.work", .{stash}) catch return false;
+    if (sandbox.isDirectory(work)) sandbox.deleteTree(work);
+
+    if (sandbox.pathExists(stash)) {
+        warn("applied, but could not remove the stash: {s}", .{stash});
+        return false;
+    }
+    return true;
 }
 
 fn formatAge(seconds: i64, buf: []u8) []const u8 {
@@ -958,11 +1012,14 @@ fn getHostCwd(buf: []u8) []const u8 {
 }
 
 fn printVersion() void {
-    if (git_commit.len > 0) {
-        print("poof {s} ({s})\n", .{ version, git_commit });
-    } else {
+    if (git_commit.len == 0) {
         print("poof {s}\n", .{version});
+        return;
     }
+    // A commit looked up at configure time is cached with build.zig and can lag
+    // behind HEAD, so it is labelled rather than presented as fact.
+    const provenance = if (git_commit_explicit) "" else ", from last configure";
+    print("poof {s} ({s}{s})\n", .{ version, git_commit, provenance });
 }
 
 fn printApplyHelp() void {
@@ -988,7 +1045,8 @@ fn printApplyHelp() void {
     print("  to /home/me/proj/x.c. Deletions are replayed as deletions (overlay\n", .{});
     print("  whiteouts), file modes and symlinks are preserved.\n", .{});
     print("  Applying writes straight to the filesystem: the change list is shown\n", .{});
-    print("  first and confirmation is required unless --yes is given.\n", .{});
+    print("  first and confirmation is required unless --yes is given. A stash that\n", .{});
+    print("  applies in full is removed; a partial failure keeps it for a retry.\n", .{});
 
     print("\n{s}OPTIONS{s}\n", .{ B, R });
     print("  {s}--yes{s}                      Apply without prompting\n", .{ C, R });
