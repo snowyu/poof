@@ -139,6 +139,33 @@ This is ideal for:
 - Editing config files with a safety net
 - Testing installations before committing
 
+### `apply` — Replay a saved stash
+
+A session that ends without applying its changes keeps them in an upper dir (a
+*stash*). Nothing is merged back into the original directory automatically — the
+changes sit there, mirroring absolute paths, until you replay them:
+
+```bash
+poof stash list
+#   12 change(s)  3h ago  /tmp/poof-4f2a9c1b7d3e8a55
+
+poof apply /tmp/poof-4f2a9c1b7d3e8a55
+#   poof: 12 changed files /tmp/poof-4f2a9c1b7d3e8a55
+#     + home/me/proj/new-file.txt
+#     ~ home/me/proj/modified.txt
+#     - home/me/proj/deleted.txt
+#   Apply these 12 change(s) to /? [y/N]:
+
+poof apply /tmp/poof-4f2a9c1b7d3e8a55 --yes   # no prompt, for scripts
+poof run --apply=/tmp/poof-4f2a9c1b7d3e8a55 --yes
+```
+
+Because a stash mirrors absolute paths, `<stash>/home/me/proj/x.c` applies to
+`/home/me/proj/x.c`: the target is encoded in the paths, so a stash made in one
+session can be applied in another. Deletions are replayed as deletions, and file
+modes and symlinks are preserved. The change list is always shown first; applying
+without a terminal requires `--yes`.
+
 ---
 
 ## Options
@@ -149,6 +176,8 @@ This is ideal for:
 | `-h, --help` | Show help message |
 | `-V, --version` | Show version information |
 | `--upper=<dir>` | Directory for persistent changes (`run` mode) |
+| `--apply=<stash>` | Replay a saved stash onto the host (no sandbox started) |
+| `--yes` | Confirm `--apply` without prompting |
 | `--timeout=<secs>` | Kill process after N seconds (exit code 124) |
 | `--memory=<size>` | Memory limit, e.g. `100M`, `1G` |
 | `--pids=<max>` | Max processes (fork bomb protection, minimum 2) |
@@ -532,7 +561,8 @@ When the command exits, you'll see:
 
 If the session ends abnormally (`--timeout`, or SIGINT/SIGTERM/SIGHUP to poof), the
 changes are never destroyed silently: they are kept in the temp dir and poof prints
-`Stashed changes in <dir>`.
+`Stashed changes in <dir>`. That stash is applied later with `poof apply <dir>`
+(see below); `poof stash list` finds them.
 
 OPTIONS
   --upper=<dir>       Save changes to directory (skip prompt)
@@ -566,6 +596,46 @@ OPTIONS
   --pids=<max>        Max processes
 ```
 
+### `poof apply`
+
+```
+poof apply — Replay a saved upper dir (stash) onto the host
+
+USAGE
+  poof apply [options] <stash>
+  poof run --apply=<stash>     the same, script-friendly
+
+EXAMPLES
+  $ poof stash list                  # find stashes
+  $ poof apply /tmp/poof-3f9a2b      # preview, then confirm
+  $ poof apply /tmp/poof-3f9a2b --yes
+
+NOTES
+  A stash mirrors absolute paths, so <stash>/home/me/proj/x.c applies
+  to /home/me/proj/x.c. Deletions are replayed as deletions (overlay
+  whiteouts), file modes and symlinks are preserved.
+  Applying writes straight to the filesystem: the change list is shown
+  first and confirmation is required unless --yes is given.
+
+OPTIONS
+  --yes                      Apply without prompting
+  -h, --help                 Show this help
+```
+
+The stash is kept after applying: remove it yourself once you are done.
+A stash you chose with `--upper=<dir>` is applied by path — only poof's own
+`/tmp/poof-<hex>` upper dirs are listed by `poof stash list`.
+
+### `poof stash list`
+
+```
+poof stash list — List stashes left in /tmp
+
+  12 change(s)  3h ago  /tmp/poof-4f2a9c1b7d3e8a55
+
+Stashes with no changes are skipped. poof never deletes a stash on its own.
+```
+
 ### `poof` (no args)
 
 ```
@@ -582,12 +652,16 @@ COMMANDS
   exec  <program>             Run in ephemeral mode (changes vanish)
   run   <program>             Review & apply on exit (or --upper to persist)
   enter                       Interactive $SHELL (review & apply on exit)
+  apply <stash>               Replay a saved upper dir onto the host
+  stash list                  List stashes left in /tmp
 
 OPTIONS
   -v, --verbose               Show detailed progress
   -h, --help                  Show this help
   -V, --version               Show version
   --upper=<dir>               Directory for changes (run mode)
+  --apply=<stash>             Replay a saved stash (no sandbox)
+  --yes                       Confirm --apply without prompting
   --timeout=<secs>            Kill after N seconds
   --memory=<bytes>            Memory limit (e.g. 100M, 1G)
   --pids=<max>                Max processes (fork bomb protection)

@@ -226,7 +226,10 @@ fn hasOpaqueMarker(src_dir: []const u8) bool {
     return false;
 }
 
-fn isWhiteout(entry_kind: sandbox.DirEntryKind, stat: ?FileInfo) bool {
+// Both representations of a deletion: the 0:0 character device (kernel driver
+// and fuse-overlayfs) and the ".wh.<name>" regular file (userspace whiteout).
+fn isWhiteout(name: []const u8, entry_kind: sandbox.DirEntryKind, stat: ?FileInfo) bool {
+    if (entry_kind != .directory and whiteoutName(name) != null) return true;
     if (stat) |fi| {
         if (fi.is_char) return fi.is_whiteout_dev;
         return false;
@@ -234,6 +237,9 @@ fn isWhiteout(entry_kind: sandbox.DirEntryKind, stat: ?FileInfo) bool {
     // statx unavailable (pre-4.11 kernel): fall back to the dirent type.
     return entry_kind == .character_device;
 }
+
+// Commands that do not start a sandbox: they work on what a sandbox left behind.
+const Subcommand = enum { apply, stash };
 
 const ChangeType = enum { added, edited, deleted };
 
@@ -296,16 +302,22 @@ fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: 
                 changes.append(.{ .path = path_with_slash, .change_type = .added });
             }
         } else if (entry.kind == .character_device or whiteoutName(entry.name) != null) {
-            // Whiteout - file was deleted
-            const is_marker = blk: {
-                if (whiteoutName(entry.name) != null) break :blk true;
-                const src_z = zPath(full_path) orelse break :blk true;
-                const fi = fileInfo(src_z) orelse break :blk true;
-                break :blk fi.is_whiteout_dev;
-            };
-            if (is_marker) {
-                changes.append(.{ .path = display_path, .change_type = .deleted });
+            const src_z = zPath(full_path) orelse continue;
+            if (isWhiteout(entry.name, entry.kind, fileInfo(src_z))) {
+                // Deleted: show the name the entry had in the target, not the
+                // ".wh." marker that stands in for it.
+                var shown = display_path;
+                if (whiteoutName(entry.name)) |base| {
+                    if (std.mem.endsWith(u8, display_path, entry.name)) {
+                        shown = std.fmt.allocPrint(allocator, "{s}{s}", .{
+                            display_path[0 .. display_path.len - entry.name.len],
+                            base,
+                        }) catch continue;
+                    }
+                }
+                changes.append(.{ .path = shown, .change_type = .deleted });
             } else {
+                // A real character device the sandbox created.
                 changes.append(.{ .path = display_path, .change_type = .added });
             }
         } else {
@@ -572,7 +584,9 @@ fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats) void 
         };
     }
 
-    if (hasOpaqueMarker(src_dir)) clearDir(dst_dir, stats);
+    // Never let an opaque marker wipe the filesystem root: that would be the
+    // upper dir's own marker, not a user replacing a directory.
+    if (hasOpaqueMarker(src_dir) and !std.mem.eql(u8, dst_dir, "/")) clearDir(dst_dir, stats);
 
     while (dir.next()) |entry| {
         // Overlay bookkeeping, never user data.
@@ -589,7 +603,7 @@ fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats) void 
         const dst_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_dir, dst_name }) catch continue;
         const dst_z = zPath(dst_path) orelse continue;
 
-        if (isWhiteout(entry.kind, fi)) {
+        if (isWhiteout(entry.name, entry.kind, fi)) {
             removeTarget(dst_path);
             stats.applied += 1;
             continue;
@@ -640,6 +654,165 @@ fn applyChanges(source: []const u8, target: []const u8) void {
     } else {
         err("applied {d} change(s), {d} failed", .{ stats.applied, stats.failed });
     }
+}
+
+// ============================================================================
+// Stash lifecycle: list saved upper dirs and replay them onto the host
+// ============================================================================
+
+// A stash is an upper dir: its contents mirror absolute paths, so the target of
+// every entry is encoded in the path itself and no sidecar metadata is needed.
+fn resolveStash(input: []const u8, cwd: []const u8) ?[]const u8 {
+    var path = input;
+    while (path.len > 1 and path[path.len - 1] == '/') path = path[0 .. path.len - 1];
+    if (path.len == 0) return null;
+
+    const abs = if (path[0] == '/')
+        path
+    else if (std.mem.eql(u8, cwd, "/"))
+        std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return null
+    else
+        std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, path }) catch return null;
+
+    if (std.mem.eql(u8, abs, "/")) {
+        err("refusing to treat / as a stash", .{});
+        return null;
+    }
+    if (!sandbox.isDirectory(abs)) {
+        err("not a stash directory: {s}", .{abs});
+        return null;
+    }
+    return abs;
+}
+
+fn collectStashChanges(stash: []const u8, changes: *ChangeList) void {
+    // The upper dir mirrors absolute paths, so the target is the filesystem root.
+    collectChanges(stash, "/", stash, changes);
+}
+
+fn applyStash(input: []const u8, cwd: []const u8, assume_yes: bool) u8 {
+    const stash = resolveStash(input, cwd) orelse return 1;
+
+    var change_buf: [1000]Change = undefined;
+    var changes = ChangeList{ .items = &change_buf, .len = 0 };
+    collectStashChanges(stash, &changes);
+
+    if (changes.len == 0) {
+        info("no changes in {s}", .{stash});
+        return 0;
+    }
+
+    // The preview is the safety mechanism: applying writes straight to /.
+    printChanges(changes.items[0..changes.len], stash);
+    print("\n", .{});
+
+    if (!assume_yes) {
+        if (std.c.isatty(std.posix.STDIN_FILENO) != 1) {
+            err("refusing to apply {d} change(s) to / without a terminal; pass --yes to confirm", .{changes.len});
+            return 1;
+        }
+        const c1 = col(Color.bold_yellow);
+        const c2 = col(Color.reset);
+        print("{s}Apply these {d} change(s) to /?{s} [y/N]: ", .{ c1, changes.len, c2 });
+        var input_buf: [16]u8 = undefined;
+        const n = readStdin(&input_buf) orelse {
+            print("\n", .{});
+            return 130;
+        };
+        const trimmed = std.mem.trim(u8, input_buf[0..n], " \t\r\n");
+        if (!(std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y") or std.mem.eql(u8, trimmed, "yes"))) {
+            info("not applied; stash kept in {s}", .{stash});
+            return 0;
+        }
+    }
+
+    var stats = ApplyStats{};
+    applyTree(stash, "/", &stats);
+
+    if (stats.failed != 0) {
+        err("applied {d} change(s), {d} failed", .{ stats.applied, stats.failed });
+        return 1;
+    }
+    success("Applied {d} change(s) from {s}", .{ stats.applied, stash });
+    log("stash kept in {s}; remove it when you are done", .{stash});
+    return 0;
+}
+
+fn formatAge(seconds: i64, buf: []u8) []const u8 {
+    const abs = if (seconds < 0) -seconds else seconds;
+    if (abs < 60) return std.fmt.bufPrint(buf, "{d}s ago", .{seconds}) catch "unknown";
+    if (abs < 3600) return std.fmt.bufPrint(buf, "{d}m ago", .{@divTrunc(seconds, 60)}) catch "unknown";
+    if (abs < 86400) return std.fmt.bufPrint(buf, "{d}h ago", .{@divTrunc(seconds, 3600)}) catch "unknown";
+    return std.fmt.bufPrint(buf, "{d}d ago", .{@divTrunc(seconds, 86400)}) catch "unknown";
+}
+
+fn stashAge(path_z: [*:0]const u8) ?i64 {
+    var sx: linux.Statx = undefined;
+    const r = linux.statx(linux.AT.FDCWD, path_z, linux.AT.SYMLINK_NOFOLLOW, .BASIC_STATS, &sx);
+    if (sandbox.errnoFromSyscall(r) != .SUCCESS) return null;
+    const now = clockSecs(posix.CLOCK.REALTIME) orelse return null;
+    return now - sx.mtime.sec;
+}
+
+// poof names its temp upper dirs /tmp/poof-<16 hex>. Matching that exactly keeps
+// unrelated /tmp/poof-* directories out of the listing; a stash the user chose
+// with --upper=<dir> is applied by path, it is never listed.
+fn isStashName(name: []const u8) bool {
+    if (!std.mem.startsWith(u8, name, "poof-")) return false;
+    const suffix = name[5..];
+    if (suffix.len != 16) return false;
+    for (suffix) |ch| {
+        if (!std.ascii.isHex(ch)) return false;
+    }
+    return true;
+}
+
+fn listStashes() u8 {
+    var dir = sandbox.DirStream.open("/tmp") orelse {
+        err("cannot read /tmp", .{});
+        return 1;
+    };
+    defer dir.close();
+
+    const B = col(Color.bold);
+    const D = col(Color.dim);
+    const R = col(Color.reset);
+
+    var found: usize = 0;
+    while (dir.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!isStashName(entry.name)) continue;
+
+        const path = std.fmt.allocPrint(allocator, "/tmp/{s}", .{entry.name}) catch continue;
+        const path_z = zPath(path) orelse continue;
+
+        var change_buf: [1000]Change = undefined;
+        var changes = ChangeList{ .items = &change_buf, .len = 0 };
+        collectStashChanges(path, &changes);
+        if (changes.len == 0) continue; // an empty upper dir is not worth listing
+
+        var age_buf: [32]u8 = undefined;
+        const age = stashAge(path_z) orelse 0;
+        print("  {s}{d}{s} change(s)  {s}{s}{s}  {s}\n", .{
+            B,
+            changes.len,
+            R,
+            D,
+            formatAge(age, &age_buf),
+            R,
+            path,
+        });
+        found += 1;
+    }
+
+    if (found == 0) {
+        info("no stashes with changes in /tmp", .{});
+        log("a --upper=<dir> stash is applied by path: poof apply <dir>", .{});
+        return 0;
+    }
+    print("\n", .{});
+    info("apply one with: poof apply <dir>", .{});
+    return 0;
 }
 
 pub fn run(config: Config) u8 {
@@ -792,6 +965,36 @@ fn printVersion() void {
     }
 }
 
+fn printApplyHelp() void {
+    const C = col(Color.cyan);
+    const B = col(Color.bold);
+    const D = col(Color.dim);
+    const R = col(Color.reset);
+
+    print("\n", .{});
+    print("{s}poof apply{s} \u{2014} Replay a saved upper dir (stash) onto the host\n", .{ C, R });
+
+    print("\n{s}USAGE{s}\n", .{ B, R });
+    print("  {s}poof apply{s} [options] <stash>\n", .{ C, R });
+    print("  {s}poof run --apply=<stash>{s}     the same, script-friendly\n", .{ C, R });
+
+    print("\n{s}EXAMPLES{s}\n", .{ B, R });
+    print("  $ poof stash list                  {s}# find stashes{s}\n", .{ D, R });
+    print("  $ poof apply /tmp/poof-3f9a2b      {s}# preview, then confirm{s}\n", .{ D, R });
+    print("  $ poof apply /tmp/poof-3f9a2b --yes\n", .{});
+
+    print("\n{s}NOTES{s}\n", .{ B, R });
+    print("  A stash mirrors absolute paths, so <stash>/home/me/proj/x.c applies\n", .{});
+    print("  to /home/me/proj/x.c. Deletions are replayed as deletions (overlay\n", .{});
+    print("  whiteouts), file modes and symlinks are preserved.\n", .{});
+    print("  Applying writes straight to the filesystem: the change list is shown\n", .{});
+    print("  first and confirmation is required unless --yes is given.\n", .{});
+
+    print("\n{s}OPTIONS{s}\n", .{ B, R });
+    print("  {s}--yes{s}                      Apply without prompting\n", .{ C, R });
+    print("  {s}-h, --help{s}                 Show this help\n", .{ C, R });
+}
+
 fn printModeHelp(mode: sandbox.Mode) void {
     const C = col(Color.cyan);
     const B = col(Color.bold);
@@ -891,8 +1094,10 @@ fn printUsage() void {
         \\  {s}exec{s}  <program>             Run in ephemeral mode {s}(changes vanish){s}
         \\  {s}run{s}   <program>             Review & apply on exit {s}(or --upper to persist){s}
         \\  {s}enter{s}                       Interactive $SHELL {s}(review & apply on exit){s}
+        \\  {s}apply{s} <stash>              Replay a saved upper dir onto the host
+        \\  {s}stash{s} list                 List stashes left in /tmp
         \\
-    , .{ B, R, C, R, Y, R, G, R, B, R, C, R, D, R, C, R, D, R, C, R, D, R });
+    , .{ B, R, C, R, Y, R, G, R, B, R, C, R, D, R, C, R, D, R, C, R, D, R, C, R, C, R });
 
     // Options
     print(
@@ -955,7 +1160,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var upper_dir: ?[]const u8 = null;
     var mode: ?Mode = null;
+    var sub: ?Subcommand = null;
+    var apply_opt: ?[]const u8 = null;
+    var assume_yes = false;
     var cmd_start: usize = args.len;
+    var sub_arg: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -963,7 +1172,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             // Help is the requested result, so it goes to stdout (exit 0).
             output.routeToStdout(true);
-            if (mode) |m| printModeHelp(m) else printUsage();
+            if (sub != null and sub.? == .apply) printApplyHelp() else if (mode) |m| printModeHelp(m) else printUsage();
             output.routeToStdout(false);
             return 0;
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
@@ -975,6 +1184,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             output.setVerbose(true);
         } else if (std.mem.startsWith(u8, arg, "--upper=")) {
             upper_dir = arg[8..];
+        } else if (std.mem.startsWith(u8, arg, "--apply=")) {
+            if (arg[8..].len == 0) {
+                err("invalid apply: (use --apply=<stash dir>)", .{});
+                return 1;
+            }
+            apply_opt = arg[8..];
+            sub = .apply;
+        } else if (std.mem.eql(u8, arg, "--yes")) {
+            assume_yes = true;
         } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
             const secs = std.fmt.parseInt(u32, arg[10..], 10) catch {
                 err("invalid timeout: {s}", .{arg[10..]});
@@ -1020,7 +1238,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             mode = .run;
         } else if (std.mem.eql(u8, arg, "enter")) {
             mode = .enter;
+        } else if (std.mem.eql(u8, arg, "apply") and mode == null) {
+            // Only a subcommand while no mode is set, so `poof exec apply` still
+            // runs a program called apply.
+            sub = .apply;
+        } else if (std.mem.eql(u8, arg, "stash") and mode == null) {
+            sub = .stash;
         } else if (arg.len > 0 and arg[0] != '-') {
+            if (sub != null) {
+                // Subcommands take at most one positional, but options may still
+                // follow it (poof apply <stash> --yes).
+                if (sub_arg != null) {
+                    err("too many arguments: {s}", .{arg});
+                    return 1;
+                }
+                sub_arg = arg;
+                continue;
+            }
             cmd_start = i;
             break;
         } else {
@@ -1028,6 +1262,32 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
     }
+
+    // Subcommands work on a previous session's stash; they never start a sandbox.
+    if (sub) |s| {
+        switch (s) {
+            .apply => {
+                const target = apply_opt orelse sub_arg;
+                if (target == null) {
+                    err("apply needs a stash directory: poof apply <stash>", .{});
+                    return 1;
+                }
+                if (apply_opt != null and sub_arg != null) {
+                    err("apply takes no command: {s}", .{sub_arg.?});
+                    return 1;
+                }
+                return applyStash(target.?, cwd, assume_yes);
+            },
+            .stash => {
+                const what = sub_arg orelse "list";
+                if (std.mem.eql(u8, what, "list")) return listStashes();
+                err("unknown stash subcommand: {s} (try: poof stash list)", .{what});
+                return 1;
+            },
+        }
+    }
+
+    if (assume_yes) warn("--yes is only used by apply; ignored", .{});
 
     if (mode == null) {
         // Check if first arg is a known shell - treat as `poof exec <shell>`

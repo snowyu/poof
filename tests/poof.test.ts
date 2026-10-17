@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { spawn, spawnSync } from "bun";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync } from "fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync, symlinkSync, chmodSync } from "fs";
 import { join } from "path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -1267,6 +1267,174 @@ describe("poof CLI", () => {
       expect(existsSync(join(stash!, testFile))).toBe(true);
       cleanupStash(session.output);
     }, 20_000);
+  });
+
+  // ============================================================================
+  // Stash lifecycle — poof stash list / poof apply
+  // ============================================================================
+  describe("stash apply", () => {
+    let stashDir: string; // a fake upper dir: its tree mirrors absolute paths
+    let targetDir: string; // what that stash applies onto
+
+    beforeEach(() => {
+      stashDir = mkdtempSync(join(TEST_DIR, "stash-"));
+      targetDir = mkdtempSync(join(TEST_DIR, "apply-target-"));
+    });
+
+    afterEach(() => {
+      rmSync(stashDir, { recursive: true, force: true });
+      rmSync(targetDir, { recursive: true, force: true });
+    });
+
+    // Where an absolute path lives inside the upper dir.
+    const mirror = (abs: string) => join(stashDir, abs);
+
+    test("stash list says so when there is nothing to apply", () => {
+      const r = spawnSync([POOF_BIN, "stash", "list"]);
+      const out = r.stdout.toString() + r.stderr.toString();
+      expect(r.exitCode).toBe(0);
+      expect(out.includes("no stashes with changes") || /poof-[0-9a-f]{16}/.test(out)).toBe(true);
+    });
+
+    test("apply without a stash argument fails", () => {
+      const r = spawnSync([POOF_BIN, "apply"]);
+      expect(r.stderr.toString()).toContain("needs a stash directory");
+      expect(r.exitCode).toBe(1);
+    });
+
+    test("apply rejects a directory that is not there", () => {
+      const r = spawnSync([POOF_BIN, "apply", join(TEST_DIR, "not-a-stash")]);
+      expect(r.stderr.toString()).toContain("not a stash directory");
+      expect(r.exitCode).toBe(1);
+    });
+
+    test("apply refuses / as a stash", () => {
+      const r = spawnSync([POOF_BIN, "apply", "/"]);
+      expect(r.stderr.toString()).toContain("refusing to treat /");
+      expect(r.exitCode).toBe(1);
+    });
+
+    test("a second positional argument is rejected", () => {
+      const r = spawnSync([POOF_BIN, "apply", stashDir, targetDir]);
+      expect(r.stderr.toString()).toContain("too many arguments");
+      expect(r.exitCode).toBe(1);
+    });
+
+    test("apply shows the changes and refuses to write without a terminal", () => {
+      mkdirSync(mirror(targetDir), { recursive: true });
+      writeFileSync(join(mirror(targetDir), "never-written.txt"), "new\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir]);
+      expect(r.stderr.toString()).toContain("without a terminal");
+      expect(r.exitCode).toBe(1);
+      expect(existsSync(join(targetDir, "never-written.txt"))).toBe(false);
+    });
+
+    test("apply --yes replays adds, edits, deletions, modes and symlinks", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(join(mirrored, "sub"), { recursive: true });
+      writeFileSync(join(mirrored, "added.txt"), "added\n");
+      writeFileSync(join(mirrored, "edited.txt"), "edited\n");
+      writeFileSync(join(mirrored, ".wh.deleted.txt"), ""); // userspace whiteout
+      writeFileSync(join(mirrored, "sub", "nested.txt"), "nested\n");
+      symlinkSync("added.txt", join(mirrored, "link.txt"));
+      chmodSync(join(mirrored, "added.txt"), 0o750);
+
+      writeFileSync(join(targetDir, "edited.txt"), "original\n");
+      writeFileSync(join(targetDir, "deleted.txt"), "still here\n");
+      mkdirSync(join(targetDir, "sub"));
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stderr.toString()).toContain("Applied 5 change(s)");
+
+      expect(readFileSync(join(targetDir, "added.txt"), "utf8")).toBe("added\n");
+      expect(readFileSync(join(targetDir, "edited.txt"), "utf8")).toBe("edited\n");
+      expect(readFileSync(join(targetDir, "sub", "nested.txt"), "utf8")).toBe("nested\n");
+      expect(existsSync(join(targetDir, "deleted.txt"))).toBe(false);
+      expect(readlinkSync(join(targetDir, "link.txt"))).toBe("added.txt");
+      expect(statSync(join(targetDir, "added.txt")).mode & 0o777).toBe(0o750);
+    });
+
+    test("the preview names a deletion by its target path, not the .wh. marker", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, ".wh.gone.txt"), "");
+      writeFileSync(join(targetDir, "gone.txt"), "x\n");
+
+      const out = spawnSync([POOF_BIN, "apply", stashDir]).stderr.toString();
+      expect(out).toContain(`${targetDir.slice(1)}/gone.txt`);
+      expect(out).not.toContain(".wh.");
+    });
+
+    test("an empty stash applies nothing", () => {
+      const r = spawnSync([POOF_BIN, "apply", stashDir]);
+      expect(r.stdout.toString() + r.stderr.toString()).toContain("no changes in");
+      expect(r.exitCode).toBe(0);
+    });
+
+    test("poof run --apply=<stash> applies without starting a sandbox", () => {
+      mkdirSync(mirror(targetDir), { recursive: true });
+      writeFileSync(join(mirror(targetDir), "via-run.txt"), "via run\n");
+
+      const r = spawnSync([POOF_BIN, "run", `--apply=${stashDir}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(join(targetDir, "via-run.txt"), "utf8")).toBe("via run\n");
+    });
+
+    test("apply --help goes to stdout", () => {
+      const r = spawnSync([POOF_BIN, "apply", "--help"]);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.toString()).toContain("poof apply");
+      expect(r.stdout.toString()).toContain("--yes");
+    });
+
+    test("stash list finds a stash by its poof-<hex> name", () => {
+      const named = join("/tmp", `poof-${"ab".repeat(8)}`);
+      mkdirSync(join(named, targetDir.slice(1)), { recursive: true });
+      writeFileSync(join(named, targetDir.slice(1), "listed.txt"), "x\n");
+      try {
+        const r = spawnSync([POOF_BIN, "stash", "list"]);
+        expect(r.stdout.toString() + r.stderr.toString()).toContain(named);
+      } finally {
+        rmSync(named, { recursive: true, force: true });
+      }
+    });
+
+    test("stash list ignores /tmp dirs that are not poof upper dirs", () => {
+      const named = join("/tmp", "poof-not-a-stash");
+      mkdirSync(join(named, "var"), { recursive: true });
+      writeFileSync(join(named, "var", "junk.txt"), "x\n");
+      try {
+        const r = spawnSync([POOF_BIN, "stash", "list"]);
+        expect(r.stdout.toString() + r.stderr.toString()).not.toContain("poof-not-a-stash");
+      } finally {
+        rmSync(named, { recursive: true, force: true });
+      }
+    });
+
+    test("a deletion made in a real session is applied for real", async () => {
+      const dir = mkdtempSync(join(TEST_DIR, "apply-e2e-"));
+      const victim = join(dir, "victim.txt");
+      writeFileSync(victim, "delete me\n");
+
+      const session = new TerminalSession(dir, undefined, ["sh", "-c", `rm ${victim}`], "run");
+      await session.waitForNew("[y/N/d(iff)]");
+      session.write("n\n"); // decline in the session, apply it later via the stash
+      await session.waitFor("Stashed changes in");
+      await session.waitForExit();
+
+      const stash = stashPath(session.output);
+      expect(stash).not.toBeNull();
+      expect(existsSync(victim)).toBe(true);
+
+      const r = spawnSync([POOF_BIN, "apply", stash!, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(victim)).toBe(false);
+
+      cleanupStash(session.output);
+      rmSync(dir, { recursive: true, force: true });
+    }, 30_000);
   });
 
   // ============================================================================
