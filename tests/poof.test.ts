@@ -1229,6 +1229,9 @@ describe("poof CLI", () => {
       const stash = stashPath(session.output);
       expect(stash).not.toBeNull();
       expect(existsSync(join(stash!, testFile))).toBe(true);
+      // The overlay work dir is meaningless once the mount is gone: it must not
+      // litter the stash.
+      expect(existsSync(stash! + ".work")).toBe(false);
       rmSync(stash!, { recursive: true, force: true });
     });
 

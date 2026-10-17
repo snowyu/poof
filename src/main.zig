@@ -461,7 +461,10 @@ fn stashInteractiveChanges() void {
 fn keepChanges(upper_dir: []const u8) void {
     // Don't delete the temp dir - user wants to keep it
     sandbox.cleanup_temp_base = null;
-    sandbox.cleanup_work_dir = null;
+    // The overlay work dir (<upper>.work) is only meaningful while the overlay is
+    // mounted: whiteouts live in the upper dir, so once we are done with the mount
+    // it is dead weight. Keep it out of the stash; a fresh workdir can be created
+    // if the stash ever gets mounted again to browse.
     // cleanup_merged_base stays: it only ever holds the overlay mount point, never user data
     const dim = col(Color.dim);
     const r = col(Color.reset);
