@@ -6,7 +6,7 @@
   Ephemeral filesystem isolation
 </pre>
 
-**Run any command in an isolated environment where filesystem changes never affect your host.** When the command exits, changes vanish — or persist to a directory of your choice — or get reviewed and selectively applied. Linux only.
+**Run any command in an isolated environment where filesystem changes never touch your host until you say so.** When the command exits, its changes are discarded — or kept in a directory you choose, ready to review and apply. Linux only.
 
 > **Warning**: This is an **experimental** package. It was written by Claude in a couple of hours and has minimal testing. Use at your own risk.
 
@@ -31,12 +31,12 @@ poof enter
 | Feature | Description |
 |---------|-------------|
 | **Zero-trace execution** | Run commands without leaving any trace on the host filesystem |
-| **Persistent mode** | Capture all changes to a directory for inspection or replay |
+| **Stash & replay** | A session's changes land in one directory (an overlay upper dir); inspect it, or replay it with `poof apply` |
 | **Interactive mode** | Edit files in a sandbox, then review a diff and apply changes |
-| **Full isolation** | Mount, PID, UTS, and IPC namespace isolation |
+| **Namespace isolation** | Mount, PID, UTS and IPC namespaces (network is *not* isolated — see below) |
 | **Resource limits** | Memory limits, process limits, timeouts via cgroups v2 |
-| **Container-aware** | Works inside Docker/Podman (one nesting level) |
-| **Single binary** | ~450KB static executable with no dependencies |
+| **Container-aware** | `exec` works inside Docker/Podman; `run`/`enter` need an upper dir that is not itself on an overlay |
+| **Single binary** | ~350KB static executable with no dependencies |
 
 ---
 
@@ -112,7 +112,7 @@ curl -s https://example.com/setup.sh | poof exec bash
 
 ### `run` — Interactive by default
 
-When run interactively (tty), shows a diff and prompts to apply changes — just like `enter` but with any command. When run non-interactively (scripts/pipes), auto-saves to a directory named after the command.
+When run interactively (tty), shows the change list and prompts to apply them — just like `enter` but with any command. When run non-interactively (scripts/pipes), the changes are kept in a stash named after the command, which you replay later with `poof apply`.
 
 ```bash
 # Let Claude edit your code, review changes before applying
@@ -171,6 +171,13 @@ session can be applied in another. Deletions are replayed as deletions, and file
 modes and symlinks are preserved. The change list is always shown first; applying
 without a terminal requires `--yes`.
 
+Apply is a replay, not a merge: the stash's copy of a file wins and its deletions
+delete, whatever the host did in the meantime. Measured — a session stashed a new
+version of `mod.txt` and a deletion of `del.txt`; the host then rewrote `mod.txt` and
+recreated `del.txt`; after `poof apply` the file holds the session's version and
+`del.txt` is gone again. Review the list (or `poof apply` without `--yes`) before
+applying a stash onto a tree that has moved on.
+
 ---
 
 ## Options
@@ -180,7 +187,7 @@ without a terminal requires `--yes`.
 | `-v, --verbose` | Show detailed progress and debug info |
 | `-h, --help` | Show help message |
 | `-V, --version` | Show version information |
-| `--upper=<dir>` | Directory for persistent changes (`run` mode) |
+| `--upper=<dir>` | Where a session's changes are kept instead of a temp dir (`run` mode); the host is untouched until you `poof apply` it |
 | `--apply=<stash>` | Replay a saved stash onto the host (no sandbox started) |
 | `--yes` | Confirm `--apply` without prompting |
 | `--timeout=<secs>` | Kill process after N seconds (exit code 124) |
@@ -211,7 +218,7 @@ poof exec --memory=1G --pids=100 --timeout=60 cargo build
 
 ## How It Works
 
-poof uses Linux kernel features to create complete isolation:
+poof leans on four Linux kernel features:
 
 ```
 ┌─────────────────────────────────────────┐
@@ -236,9 +243,52 @@ poof uses Linux kernel features to create complete isolation:
 | **UTS** | Isolated hostname |
 | **IPC** | Isolated System V IPC |
 
-- `exec` mode: Upper layer is a tmpfs that vanishes on exit
-- `run` mode: Upper layer is a real directory that persists
-- `enter` mode: Upper layer is a temp directory, contents applied on confirmation
+- `exec` mode: the upper layer is a tmpfs that is destroyed on exit
+- `run` mode: the upper layer is a directory you chose, so the changes outlive the session as a stash — the host tree is still untouched
+- `enter` mode: the upper layer is a temp directory, replayed onto the host if you confirm
+
+### The lower layer is the live root
+
+poof never copies or snapshots the tree it sandboxes. The overlay it mounts is always:
+
+```
+lowerdir=/   upperdir=<your dir, or a temp dir>   workdir=<upperdir>.work
+```
+
+The lower layer *is* the live root mount, and the upper layer holds only what the
+command changed. That is why a stash is just the upper dir — no saved lower layer, no
+snapshot to keep in sync. It mirrors absolute paths from `/`
+(`<stash>/home/me/proj/x.c` → `/home/me/proj/x.c`), and `poof apply` replays those
+deltas onto the filesystem **as it is now** - apply is a replay, not a merge against a
+snapshot ([`poof apply`](#apply--replay-a-saved-stash)).
+
+The `workdir` is overlayfs bookkeeping and must sit on the same filesystem as the
+upper dir; poof puts it beside it as `<upperdir>.work` and removes it when the session
+ends. A stash is only the upper dir.
+
+### Filesystems mounted under the root
+
+The lower layer is one mount — the root — so a filesystem mounted *below* it is not
+part of the overlay:
+
+| | as root (kernel overlayfs) | unprivileged (fuse-overlayfs) |
+|---|---|---|
+| contents of a fs mounted at e.g. `/data` | **not visible**: the sandbox sees `/data` as it exists on the root mount, with the mounted tree hidden behind it | visible and readable (the lower is reached by ordinary path lookups) |
+| writing there during a session | goes into the upper dir | goes into the upper dir |
+| after `poof apply` | the stashed path is written to whatever is mounted there at apply time | same |
+
+Measured with a tmpfs on `/data` holding `on-mount.txt`, over a root mount that has
+`under.txt` in that directory: a root session lists `under.txt` and reports
+`on-mount.txt` as missing; an unprivileged session lists both. Either way a write to
+`/data/new.txt` lands in the stash as `data/new.txt` and reaches the tmpfs only when
+applied.
+
+So the overlay's domain is the root mount's tree: a nested mount is at best readable
+(fuse-overlayfs), never written, and with the kernel driver not even readable. If the
+tree you care about lives on its own mount — a separate `/home` partition, a container
+volume, a `--tmpfs` — poof is not overlaying it: run poof where that filesystem *is*
+the root (inside a container, that is what `./scripts/test-docker.sh` arranges by
+moving the container onto a plain tmpfs root).
 
 ---
 
@@ -316,11 +366,11 @@ poof says so rather than failing obscurely:
 ✗ error: /var/tmp/up is on overlayfs - put it on a tmpfs or a volume (in Docker: --tmpfs /var/tmp)
 ```
 
-Note that a `--tmpfs` mount is only for the upper dir: a *target* directory that
-lives on a nested mount is not visible inside the sandbox, because the sandbox
-overlays the container's own root. Run the test suite in a container with
-`./scripts/test-docker.sh`, which moves the container onto a plain tmpfs root so
-the whole tree can be overlaid.
+Note that a `--tmpfs` mount is only good for the upper dir: a *target* directory on a
+nested mount is not part of the overlay at all, because the lower layer is the
+container's own root ([Filesystems mounted under the root](#filesystems-mounted-under-the-root)).
+Run the test suite in a container with `./scripts/test-docker.sh`, which moves the
+container onto a plain tmpfs root so the whole tree can be overlaid.
 
 ### Docker Permission Reference
 
@@ -416,6 +466,9 @@ poof is designed to make **filesystem changes reversible**, not to provide full 
   overlay mount, and a container root usually is one; point `--upper` at a tmpfs
   or a volume, or use `exec` (see [Docker / Container Support](#docker--container-support))
 - **Special filesystems** — `/proc`, `/sys`, `/dev` are remounted fresh
+- **Nested mounts** — the lower layer is the root mount, so filesystems mounted
+  under it sit outside the overlay
+  ([Filesystems mounted under the root](#filesystems-mounted-under-the-root))
 
 ---
 
@@ -480,10 +533,15 @@ Writing a file:
   3. Lowerdir remains untouched
 
 Deleting a file:
-  1. Create a "whiteout" character device in upperdir
+  1. Record a whiteout in upperdir — a 0:0 character device with kernel
+     overlayfs, a `.wh.<name>` entry with fuse-overlayfs
   2. Overlay hides the lowerdir file
   3. Lowerdir file remains untouched
 ```
+
+`lowerdir` is always the live root mount, never a copy of it (see [The lower layer is
+the live root](#the-lower-layer-is-the-live-root)). A stash is therefore only the
+upper dir: the deltas, mirroring absolute paths from `/`.
 
 In `exec` mode, upperdir is on a tmpfs — when the namespace exits, the tmpfs is destroyed and all changes vanish.
 
@@ -560,15 +618,17 @@ When you exit an `enter` session, poof scans the upperdir:
 For each file in upperdir:
   - Regular file that exists in target → "edited" (yellow ~)
   - Regular file that doesn't exist in target → "added" (green +)
-  - Character device (whiteout) → "deleted" (red -)
+  - Whiteout (0:0 character device, or a `.wh.` entry) → "deleted" (red -)
   - Empty directory → "added directory" (green +)
 ```
 
 If you confirm with 'y', poof replays the upperdir onto the target instead of copying it:
 whiteouts become real deletions, missing directories are created, symlinks are
 recreated as symlinks, and regular files are copied with their mode. Overlay
-bookkeeping (`.wh..wh..opq`, `.wh..opq`) is never copied, and a directory the
-sandbox created replaces the target directory's contents (opaque marker).
+bookkeeping (`.wh..wh..opq`, `.wh..opq`) is never copied, and a directory the sandbox
+created replaces the target directory's contents: the opaque marker is read from the
+`trusted.overlay.opaque` / `user.overlay.opaque` xattr the kernel driver leaves, and
+otherwise from the `.wh..wh..opq` file fuse-overlayfs writes.
 
 ---
 
@@ -606,7 +666,7 @@ USAGE
 EXAMPLES
   $ poof run claude --dangerously-skip-permissions
   $ poof run bun install              # Review changes first
-  $ poof run --upper=./changes bash   # Persist to ./changes/
+  $ poof run --upper=./changes bash   # keep the changes there
 
 When the command exits, you'll see:
   ● 3 changed files /tmp/poof-xxx
@@ -625,7 +685,7 @@ changes are never destroyed silently: they are kept in the temp dir and poof pri
 (see below); `poof stash list` finds them.
 
 OPTIONS
-  --upper=<dir>       Save changes to directory (skip prompt)
+  --upper=<dir>       Keep changes in <dir>, skip the prompt
   --timeout=<secs>    Kill after N seconds
   --memory=<size>     Memory limit (e.g. 100M, 1G)
   --pids=<max>        Max processes
@@ -712,7 +772,7 @@ USAGE
 
 COMMANDS
   exec  <program>             Run in ephemeral mode (changes vanish)
-  run   <program>             Review & apply on exit (or --upper to persist)
+  run   <program>             Review & apply on exit (--upper=<dir> keeps a stash)
   enter                       Interactive $SHELL (review & apply on exit)
   apply <stash>               Replay a saved upper dir onto the host
   stash list                  List stashes left in /tmp

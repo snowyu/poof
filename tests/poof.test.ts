@@ -675,7 +675,7 @@ describe("poof CLI", () => {
       test("uses command name as directory", () => {
         const result = spawnSync([POOF_BIN, "run", "true"], { cwd: runTestDir });
         const output = result.stderr.toString();
-        expect(output).toContain("Changes will persist to");
+        expect(output).toContain("Changes will be kept in");
         expect(output).toContain("/true");
         expect(result.exitCode).toBe(0);
 

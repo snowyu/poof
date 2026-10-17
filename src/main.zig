@@ -906,7 +906,7 @@ pub fn run(config: Config) u8 {
         // Interactive mode (enter or run without --upper)
         vstep("Entering poof mode for {s}", .{config.enter_target.?});
     } else {
-        vstep("Starting persistent environment", .{});
+        vstep("Starting session, changes kept in {s}", .{config.upper_dir orelse "(temp)"});
     }
     log("uid={} gid={}", .{ orig_uid, orig_gid });
 
@@ -1112,7 +1112,7 @@ fn printModeHelp(mode: sandbox.Mode) void {
             print("\n{s}EXAMPLES{s}\n", .{ B, R });
             print("  {s}${s} poof run claude --dangerously-skip-permissions\n", .{ D, R });
             print("  {s}${s} poof run bun install              {s}# Review changes first{s}\n", .{ D, R, D, R });
-            print("  {s}${s} poof run --upper=./changes bash   {s}# Persist to ./changes/{s}\n", .{ D, R, D, R });
+            print("  {s}${s} poof run --upper=./changes bash   {s}# keep the changes there{s}\n", .{ D, R, D, R });
             print("\n{s}When the command exits, you'll see:{s}\n", .{ D, R });
             print("  {s}poof{s}: {s}3 changed files{s} /tmp/poof-xxx\n", .{ BB, R, B, R });
             print("    {s}+{s} src/new-file.txt\n", .{ G, R });
@@ -1123,7 +1123,7 @@ fn printModeHelp(mode: sandbox.Mode) void {
             print("    {s}n{s} — Discard (keep in temp dir)\n", .{ G, R });
             print("    {s}d{s} — Show full diff first\n", .{ G, R });
             print("\n{s}OPTIONS{s}\n", .{ B, R });
-            print("  {s}--upper=<dir>{s}       Save changes to directory (skip prompt)\n", .{ G, R });
+            print("  {s}--upper=<dir>{s}       Keep changes in <dir>, skip the prompt\n", .{ G, R });
             print("  {s}--timeout=<secs>{s}    Kill after N seconds\n", .{ G, R });
             print("  {s}--memory=<size>{s}     Memory limit (e.g. 100M, 1G)\n", .{ G, R });
             print("  {s}--pids=<max>{s}        Max processes\n", .{ G, R });
@@ -1176,7 +1176,7 @@ fn printUsage() void {
         \\
         \\{s}COMMANDS{s}
         \\  {s}exec{s}  <program>             Run in ephemeral mode {s}(changes vanish){s}
-        \\  {s}run{s}   <program>             Review & apply on exit {s}(or --upper to persist){s}
+        \\  {s}run{s}   <program>             Review & apply on exit {s}(--upper=<dir> keeps a stash){s}
         \\  {s}enter{s}                       Interactive $SHELL {s}(review & apply on exit){s}
         \\  {s}apply{s} <stash>              Replay a saved upper dir onto the host
         \\  {s}stash{s} list                 List stashes left in /tmp
@@ -1502,7 +1502,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
             const hc = col(Color.bold ++ Color.cyan);
             const rc = col(Color.reset);
-            info("Changes will persist to {s}{s}{s}", .{ hc, config.upper_dir.?, rc });
+            info("Changes will be kept in {s}{s}{s}", .{ hc, config.upper_dir.?, rc });
         }
     }
 
