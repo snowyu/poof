@@ -78,7 +78,7 @@ sudo mv poof /usr/local/bin/
 
 ### From Source
 
-Requires [Zig](https://ziglang.org/) 0.16+ and Linux:
+Requires [Zig](https://ziglang.org/) 0.17+ and Linux:
 
 ```bash
 git clone https://github.com/jarred-sumner/poof

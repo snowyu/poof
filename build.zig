@@ -8,12 +8,13 @@ pub fn build(b: *std.Build) void {
     const version = b.option([]const u8, "version", "Version string") orelse "dev";
     const git_commit = b.option([]const u8, "git-commit", "Git commit hash") orelse blk: {
         // Try to get git commit at build time
-        const result = std.process.Child.run(.{
-            .allocator = b.allocator,
-            .argv = &.{ "git", "rev-parse", "--short", "HEAD" },
-            .cwd = b.build_root.path,
-        }) catch break :blk "";
-        break :blk std.mem.trim(u8, result.stdout, "\n\r ");
+        const result = b.runFallible(&.{ "git", "rev-parse", "--short", "HEAD" }, .{
+            .stderr_behavior = .ignore,
+        });
+        break :blk switch (result) {
+            .success => |stdout| std.mem.trim(u8, stdout, "\n\r "),
+            else => "",
+        };
     };
 
     const options = b.addOptions();
@@ -39,7 +40,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    // Forward `zig build run -- <args>` to the program.
+    run_cmd.addPassthruArgs();
 }

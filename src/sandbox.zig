@@ -1,11 +1,12 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const fs = std.fs;
+const c = std.c;
 const output = @import("output.zig");
 
-// C library function for setting environment variables
+// C library functions for environment and program execution
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 
 // Re-export output functions for convenience
 pub const step = output.step;
@@ -34,7 +35,7 @@ pub fn Maybe(comptime T: type) type {
 pub fn errnoFromSyscall(r: usize) Errno {
     const signed_r: isize = @bitCast(r);
     const int: u16 = if (signed_r > -4096 and signed_r < 0) @intCast(-signed_r) else 0;
-    return @enumFromInt(int);
+    return @fromBackingInt(@intCast(int));
 }
 
 pub const Mode = enum {
@@ -90,10 +91,205 @@ pub fn pivotRoot(new_root: [*:0]const u8, put_old: [*:0]const u8) Maybe(void) {
     return .{ .ok = {} };
 }
 
-pub fn writeFile(path: []const u8, content: []const u8) !void {
-    const file = try fs.openFileAbsolute(path, .{ .mode = .write_only });
-    defer file.close();
-    try file.writeAll(content);
+// ---------------------------------------------------------------------------
+// Filesystem helpers
+//
+// Zig 0.17 moved std.fs behind the std.Io interface, which is not usable from
+// the forked child of a sandbox (the Io implementation's helper threads do not
+// survive fork). These helpers use plain syscalls instead.
+// ---------------------------------------------------------------------------
+
+pub const FsError = error{
+    FileNotFound,
+    AccessDenied,
+    PermissionDenied,
+    PathAlreadyExists,
+    NotDir,
+    IsDir,
+    DirNotEmpty,
+    NameTooLong,
+    OutOfMemory,
+    InputOutput,
+    NoSpaceLeft,
+    Unexpected,
+};
+
+fn fsError(e: Errno) FsError {
+    return switch (e) {
+        .NOENT => error.FileNotFound,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .EXIST => error.PathAlreadyExists,
+        .NOTDIR => error.NotDir,
+        .ISDIR => error.IsDir,
+        .NOTEMPTY => error.DirNotEmpty,
+        .NAMETOOLONG => error.NameTooLong,
+        .NOMEM => error.OutOfMemory,
+        .IO => error.InputOutput,
+        .NOSPC => error.NoSpaceLeft,
+        else => error.Unexpected,
+    };
+}
+
+pub fn openForRead(path: []const u8) FsError!posix.fd_t {
+    const p = posix.toPosixPath(path) catch return error.NameTooLong;
+    const fd = linux.open(&p, .{}, 0);
+    const e = errnoFromSyscall(fd);
+    if (e != .SUCCESS) return fsError(e);
+    return @intCast(fd);
+}
+
+pub fn readFd(fd: posix.fd_t, buf: []u8) FsError!usize {
+    const n = linux.read(fd, buf.ptr, buf.len);
+    const e = errnoFromSyscall(n);
+    if (e != .SUCCESS) return fsError(e);
+    return n;
+}
+
+pub fn readFile(path: []const u8, buf: []u8) FsError!usize {
+    const fd = try openForRead(path);
+    defer _ = linux.close(fd);
+    return readFd(fd, buf);
+}
+
+pub fn writeFile(path: []const u8, content: []const u8) FsError!void {
+    const p = posix.toPosixPath(path) catch return error.NameTooLong;
+    // Write-only, no create/truncate: these are procfs and cgroup attribute files.
+    const fd = linux.open(&p, .{ .ACCMODE = .WRONLY }, 0);
+    const e = errnoFromSyscall(fd);
+    if (e != .SUCCESS) return fsError(e);
+    const handle: posix.fd_t = @intCast(fd);
+    defer _ = linux.close(handle);
+
+    var written: usize = 0;
+    while (written < content.len) {
+        const n = linux.write(handle, content[written..].ptr, content.len - written);
+        const we = errnoFromSyscall(n);
+        if (we != .SUCCESS) return fsError(we);
+        written += n;
+    }
+}
+
+pub fn makeDirPath(path: []const u8) FsError!void {
+    const p = posix.toPosixPath(path) catch return error.NameTooLong;
+    const e = errnoFromSyscall(linux.mkdir(&p, 0o755));
+    if (e != .SUCCESS) return fsError(e);
+}
+
+pub fn deleteDirPath(path: []const u8) FsError!void {
+    const p = posix.toPosixPath(path) catch return error.NameTooLong;
+    const e = errnoFromSyscall(linux.rmdir(&p));
+    if (e != .SUCCESS) return fsError(e);
+}
+
+pub fn createFilePath(path: []const u8) FsError!void {
+    const p = posix.toPosixPath(path) catch return error.NameTooLong;
+    const fd = linux.open(&p, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o666);
+    const e = errnoFromSyscall(fd);
+    if (e != .SUCCESS) return fsError(e);
+    _ = linux.close(@intCast(fd));
+}
+
+pub fn pathExists(path: []const u8) bool {
+    const p = posix.toPosixPath(path) catch return false;
+    return errnoFromSyscall(linux.access(&p, posix.F_OK)) == .SUCCESS;
+}
+
+pub const DirEntryKind = enum { file, directory, character_device, other };
+
+pub const DirEntry = struct {
+    name: []const u8,
+    kind: DirEntryKind,
+};
+
+/// Directory stream backed by libc opendir/readdir (no std.Io required).
+pub const DirStream = struct {
+    handle: *c.DIR,
+
+    pub fn open(path: []const u8) ?DirStream {
+        const p = posix.toPosixPath(path) catch return null;
+        const handle = c.opendir(&p) orelse return null;
+        return .{ .handle = handle };
+    }
+
+    pub fn next(self: *DirStream) ?DirEntry {
+        while (c.readdir(self.handle)) |d| {
+            const name = std.mem.sliceTo(&d.name, 0);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const kind: DirEntryKind = switch (d.type) {
+                posix.DT.DIR => .directory,
+                posix.DT.CHR => .character_device,
+                posix.DT.REG => .file,
+                else => .other,
+            };
+            return .{ .name = name, .kind = kind };
+        }
+        return null;
+    }
+
+    pub fn close(self: *DirStream) void {
+        _ = c.closedir(self.handle);
+    }
+};
+
+/// Best-effort recursive delete (replaces fs.deleteTreeAbsolute).
+pub fn deleteTree(path: []const u8) void {
+    if (DirStream.open(path)) |dir_handle| {
+        var dir = dir_handle;
+        defer dir.close();
+        while (dir.next()) |entry| {
+            const child = std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name }) catch return;
+            deleteTree(child);
+        }
+    }
+    deleteDirPath(path) catch {
+        const p = posix.toPosixPath(path) catch return;
+        _ = linux.unlink(&p);
+    };
+}
+
+/// Best-effort sleep (replaces the removed posix.nanosleep).
+pub fn sleepNs(seconds: i64, nanoseconds: i64) void {
+    const req = posix.timespec{ .sec = seconds, .nsec = nanoseconds };
+    _ = linux.nanosleep(&req, null);
+}
+
+/// Random bytes from the kernel (replaces std.crypto.random).
+fn randomBytes(buf: []u8) void {
+    const n = linux.getrandom(buf.ptr, buf.len, 0);
+    if (errnoFromSyscall(n) == .SUCCESS) return;
+    // Fall back to time-based entropy if getrandom is unavailable.
+    var ts = posix.timespec{ .sec = 0, .nsec = 0 };
+    _ = linux.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    const seed: u64 = @as(u64, @bitCast(ts.sec ^ ts.nsec)) ^ @as(u64, @intFromPtr(buf.ptr));
+    var state = seed;
+    for (buf) |*byte| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        byte.* = @truncate(state >> 33);
+    }
+}
+
+/// Run a program (resolved via PATH) and wait for it, inheriting stdio.
+/// Returns the exit code, or null if the process could not be started.
+pub fn runProcess(argv: []const []const u8) ?u8 {
+    const argvz = allocator.allocSentinel(?[*:0]const u8, argv.len, null) catch return null;
+    for (argv, 0..) |arg, i| {
+        argvz[i] = (allocator.dupeSentinel(u8, arg, 0) catch return null).ptr;
+    }
+
+    const pid = linux.fork();
+    if (pid == 0) {
+        _ = execvp(argvz[0].?, argvz.ptr);
+        c._exit(127);
+    } else if (pid > 0) {
+        var status: i32 = 0;
+        const waited = linux.waitpid(@intCast(pid), &status, 0);
+        if (errnoFromSyscall(waited) != .SUCCESS) return null;
+        const us: u32 = @bitCast(status);
+        if (linux.W.IFEXITED(us)) return linux.W.EXITSTATUS(us);
+        return 1;
+    }
+    return null;
 }
 
 // ============================================================================
@@ -122,14 +318,14 @@ pub var cleanup_merged_dir: ?[]const u8 = null; // run mode: .merged dir to dele
 pub fn cleanupOverlayDirs() void {
     // Delete temp base directory (exec and enter modes)
     if (cleanup_temp_base) |path| {
-        fs.deleteTreeAbsolute(path) catch {};
+        deleteTree(path);
     }
     // Run mode: delete the .work and .merged directories we created
     if (cleanup_work_dir) |path| {
-        fs.deleteTreeAbsolute(path) catch {};
+        deleteTree(path);
     }
     if (cleanup_merged_dir) |path| {
-        fs.deleteTreeAbsolute(path) catch {};
+        deleteTree(path);
     }
 }
 
@@ -141,10 +337,8 @@ var cgroup_path: ?[]const u8 = null;
 var original_cgroup: ?[]const u8 = null;
 
 fn getOriginalCgroup() ?[]const u8 {
-    const file = fs.openFileAbsolute("/proc/self/cgroup", .{}) catch return null;
-    defer file.close();
     var buf: [256]u8 = undefined;
-    const n = file.read(&buf) catch return null;
+    const n = readFile("/proc/self/cgroup", &buf) catch return null;
     const data = buf[0..n];
     // Format: "0::/path/to/cgroup\n"
     if (std.mem.indexOf(u8, data, "::")) |idx| {
@@ -158,24 +352,24 @@ fn getOriginalCgroup() ?[]const u8 {
 
 pub fn setupCgroup(config: Config) !void {
     // Check if cgroups v2 is available
-    fs.accessAbsolute("/sys/fs/cgroup/cgroup.controllers", .{}) catch {
+    if (!pathExists("/sys/fs/cgroup/cgroup.controllers")) {
         if (config.memory_limit != null or config.pids_limit != null) {
             return error.CgroupsNotAvailable;
         }
         return;
-    };
+    }
 
     // Save original cgroup for cleanup
     original_cgroup = getOriginalCgroup();
 
     // Create unique cgroup
     var rand_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    randomBytes(&rand_buf);
     var suffix: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&suffix, "{x:0>16}", .{std.mem.readInt(u64, &rand_buf, .little)}) catch unreachable;
     cgroup_path = try std.fmt.allocPrint(allocator, "/sys/fs/cgroup/poof-{s}", .{suffix});
 
-    fs.makeDirAbsolute(cgroup_path.?) catch |e| {
+    makeDirPath(cgroup_path.?) catch |e| {
         log("failed to create cgroup: {}", .{e});
         return e;
     };
@@ -220,7 +414,7 @@ pub fn cleanupCgroup() void {
         }
 
         // Now remove the empty cgroup
-        fs.deleteDirAbsolute(path) catch {};
+        deleteDirPath(path) catch {};
     }
 }
 
@@ -230,12 +424,22 @@ pub fn cleanupCgroup() void {
 
 pub fn makeTempDir() ![]const u8 {
     var rand_buf: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_buf);
+    randomBytes(&rand_buf);
     var suffix: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&suffix, "{x:0>16}", .{std.mem.readInt(u64, &rand_buf, .little)}) catch unreachable;
     const path = try std.fmt.allocPrint(allocator, "/tmp/poof-{s}", .{suffix});
-    try fs.makeDirAbsolute(path);
+    try makeDirPath(path);
     return path;
+}
+
+fn chdirTo(path: []const u8) bool {
+    const p = posix.toPosixPath(path) catch return false;
+    return errnoFromSyscall(linux.chdir(&p)) == .SUCCESS;
+}
+
+fn symlinkAt(target: [*:0]const u8, path: []const u8) void {
+    const p = posix.toPosixPath(path) catch return;
+    _ = linux.symlinkat(target, linux.AT.FDCWD, &p);
 }
 
 // FUSE overlay state (for non-root mode)
@@ -243,8 +447,8 @@ var fuse_overlay_pid: ?i32 = null;
 
 fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merged: []const u8) !void {
     const opts = try std.fmt.allocPrint(allocator, "lowerdir={s},upperdir={s},workdir={s},squash_to_root", .{ lower, upper, work });
-    const opts_z = try allocator.dupeZ(u8, opts);
-    const merged_z = try allocator.dupeZ(u8, merged);
+    const opts_z = try allocator.dupeSentinel(u8, opts, 0);
+    const merged_z = try allocator.dupeSentinel(u8, merged, 0);
 
     // Fork and exec fuse-overlayfs in foreground mode (-f)
     // This keeps the FUSE daemon running as a child process
@@ -260,34 +464,32 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
             null,
         };
         _ = linux.execve("/usr/bin/fuse-overlayfs", &argv, @ptrCast(std.c.environ));
-        posix.exit(127); // exec failed
+        std.process.exit(127); // exec failed
     } else if (pid > 0) {
         // Parent - save PID for cleanup, wait briefly for mount
         fuse_overlay_pid = @intCast(pid);
 
         // Give fuse-overlayfs time to set up the mount
-        posix.nanosleep(0, 100_000_000); // 100ms
+        sleepNs(0, 100_000_000); // 100ms
 
         // Check if child exited (indicates failure - it should stay running)
-        var status: u32 = 0;
+        var status: i32 = 0;
         const wait_result = linux.waitpid(@intCast(pid), &status, linux.W.NOHANG);
         if (wait_result > 0) {
             // Child exited - something went wrong
             fuse_overlay_pid = null;
-            if (linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 127) {
+            const us: u32 = @bitCast(status);
+            if (linux.W.IFEXITED(us) and linux.W.EXITSTATUS(us) == 127) {
                 return error.FuseOverlayfsNotFound;
             }
             return error.FuseOverlayfsFailed;
         }
 
         // Verify mount succeeded by checking if merged dir has content
-        var dir = fs.openDirAbsolute(merged, .{ .iterate = true }) catch {
-            return error.MountVerifyFailed;
-        };
+        var dir = DirStream.open(merged) orelse return error.MountVerifyFailed;
         defer dir.close();
 
-        var it = dir.iterate();
-        if ((it.next() catch null) == null) {
+        if (dir.next() == null) {
             // Directory is empty - mount didn't work
             return error.MountVerifyFailed;
         }
@@ -301,7 +503,7 @@ fn setupMinimalDev(merged_dir: []const u8) !void {
     const dev_path = try std.fmt.allocPrint(allocator, "{s}/dev", .{merged_dir});
 
     // Mount tmpfs on /dev
-    const dev_z = try allocator.dupeZ(u8, dev_path);
+    const dev_z = try allocator.dupeSentinel(u8, dev_path, 0);
     const mount_result = mount("tmpfs", dev_z.ptr, "tmpfs", linux.MS.NOSUID | linux.MS.NOEXEC, "mode=755,size=64k");
     if (mount_result == .err) {
         return error.MountFailed;
@@ -309,43 +511,40 @@ fn setupMinimalDev(merged_dir: []const u8) !void {
 
     // Create necessary subdirectories
     const pts_path = try std.fmt.allocPrint(allocator, "{s}/pts", .{dev_path});
-    fs.makeDirAbsolute(pts_path) catch {};
+    makeDirPath(pts_path) catch {};
 
     const shm_path = try std.fmt.allocPrint(allocator, "{s}/shm", .{dev_path});
-    fs.makeDirAbsolute(shm_path) catch {};
+    makeDirPath(shm_path) catch {};
 
     // Bind-mount only safe devices from host
     const safe_devices = [_][]const u8{ "null", "zero", "full", "random", "urandom", "tty" };
     for (safe_devices) |dev| {
         const src = try std.fmt.allocPrint(allocator, "/dev/{s}", .{dev});
         const dst = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dev_path, dev });
-        const src_z = try allocator.dupeZ(u8, src);
-        const dst_z = try allocator.dupeZ(u8, dst);
+        const src_z = try allocator.dupeSentinel(u8, src, 0);
+        const dst_z = try allocator.dupeSentinel(u8, dst, 0);
 
         // Create empty file as mount target
-        const file = fs.createFileAbsolute(dst, .{}) catch continue;
-        file.close();
+        createFilePath(dst) catch continue;
 
         // Bind mount the device
         _ = mount(src_z.ptr, dst_z.ptr, "none", linux.MS.BIND, null);
     }
 
     // Mount devpts for pseudo-terminals
-    const pts_z = try allocator.dupeZ(u8, pts_path);
+    const pts_z = try allocator.dupeSentinel(u8, pts_path, 0);
     _ = mount("devpts", pts_z.ptr, "devpts", linux.MS.NOSUID | linux.MS.NOEXEC, "newinstance,ptmxmode=0666");
 
     // Create ptmx symlink (use cwd-relative symlink creation)
     const ptmx_path = try std.fmt.allocPrint(allocator, "{s}/ptmx", .{dev_path});
-    posix.symlinkat("pts/ptmx", posix.AT.FDCWD, ptmx_path) catch {};
+    symlinkAt("pts/ptmx", ptmx_path);
 
     log("minimal /dev created (no disk devices)", .{});
 }
 
 fn isInOverlayEnvironment() bool {
-    const file = fs.openFileAbsolute("/proc/mounts", .{}) catch return false;
-    defer file.close();
     var buf: [8192]u8 = undefined;
-    const n = file.read(&buf) catch return false;
+    const n = readFile("/proc/mounts", &buf) catch return false;
     const data = buf[0..n];
 
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -391,7 +590,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         };
 
         // Always mount tmpfs for exec mode - content vanishes with namespace
-        const temp_base_z = allocator.dupeZ(u8, temp_base) catch return .{ .err = .NOMEM };
+        const temp_base_z = allocator.dupeSentinel(u8, temp_base, 0) catch return .{ .err = .NOMEM };
         switch (mount("tmpfs", temp_base_z.ptr, "tmpfs", 0, null)) {
             .err => |e| {
                 err("tmpfs mount failed: {}", .{e});
@@ -414,7 +613,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
 
     // Create directories
     inline for (.{ upper_dir, work_dir, merged_dir }) |dir| {
-        fs.makeDirAbsolute(dir) catch |e| {
+        makeDirPath(dir) catch |e| {
             if (e != error.PathAlreadyExists) {
                 err("mkdir {s}: {}", .{ dir, e });
                 return .{ .err = .ACCES };
@@ -433,12 +632,12 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     }
 
     // Mount overlay
-    const merged_z = allocator.dupeZ(u8, merged_dir) catch return .{ .err = .NOMEM };
+    const merged_z = allocator.dupeSentinel(u8, merged_dir, 0) catch return .{ .err = .NOMEM };
 
     if (use_kernel_overlay) {
         // Use kernel overlayfs (requires CAP_SYS_ADMIN)
         const opts_str = std.fmt.allocPrint(allocator, "lowerdir=/,upperdir={s},workdir={s}", .{ upper_dir, work_dir }) catch return .{ .err = .NOMEM };
-        const opts = allocator.dupeZ(u8, opts_str) catch return .{ .err = .NOMEM };
+        const opts = allocator.dupeSentinel(u8, opts_str, 0) catch return .{ .err = .NOMEM };
 
         switch (mount("overlay", merged_z.ptr, "overlay", 0, opts.ptr)) {
             .err => |e| {
@@ -488,8 +687,8 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         };
 
         const oldroot_str = std.fmt.allocPrint(allocator, "{s}/.oldroot", .{merged_dir}) catch return .{ .err = .NOMEM };
-        const oldroot = allocator.dupeZ(u8, oldroot_str) catch return .{ .err = .NOMEM };
-        fs.makeDirAbsolute(oldroot) catch |e| {
+        const oldroot = allocator.dupeSentinel(u8, oldroot_str, 0) catch return .{ .err = .NOMEM };
+        makeDirPath(oldroot) catch |e| {
             if (e != error.PathAlreadyExists) return .{ .err = .ACCES };
         };
 
@@ -498,16 +697,16 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
             .ok => {},
         }
 
-        posix.chdir(config.cwd) catch {
-            posix.chdir("/") catch {};
-        };
+        if (!chdirTo(config.cwd)) {
+            _ = chdirTo("/");
+        }
 
         // Detach old root
         switch (umount2("/.oldroot", linux.MNT.DETACH)) {
             .err => |e| return .{ .err = e },
             .ok => {},
         }
-        fs.deleteDirAbsolute("/.oldroot") catch {};
+        deleteDirPath("/.oldroot") catch {};
 
         // Mount fresh /proc for the new PID namespace
         _ = umount2("/proc", linux.MNT.DETACH);
@@ -541,9 +740,9 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
             err("chroot failed: {}", .{chroot_err});
             return .{ .err = chroot_err };
         }
-        posix.chdir(config.cwd) catch {
-            posix.chdir("/") catch {};
-        };
+        if (!chdirTo(config.cwd)) {
+            _ = chdirTo("/");
+        }
         log("chroot active", .{});
 
         // Mount fresh /proc for PID namespace (not bind-mount - that would leak host processes)
@@ -563,10 +762,10 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         }
 
         // Create symlinks for standard file descriptors (now that /proc is mounted)
-        posix.symlinkat("/proc/self/fd", posix.AT.FDCWD, "/dev/fd") catch {};
-        posix.symlinkat("/proc/self/fd/0", posix.AT.FDCWD, "/dev/stdin") catch {};
-        posix.symlinkat("/proc/self/fd/1", posix.AT.FDCWD, "/dev/stdout") catch {};
-        posix.symlinkat("/proc/self/fd/2", posix.AT.FDCWD, "/dev/stderr") catch {};
+        symlinkAt("/proc/self/fd", "/dev/fd");
+        symlinkAt("/proc/self/fd/0", "/dev/stdin");
+        symlinkAt("/proc/self/fd/1", "/dev/stdout");
+        symlinkAt("/proc/self/fd/2", "/dev/stderr");
     }
 
     if (output.isVerbose()) {
@@ -581,7 +780,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
 
 pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     // Set up death signal - if parent dies, we get SIGKILL
-    _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @as(usize, @intFromEnum(linux.SIG.KILL)), 0, 0, 0);
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(usize, @backingInt(linux.SIG.KILL)), 0, 0, 0);
 
     const is_root = orig_uid == 0;
 
@@ -610,14 +809,14 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
         if (e == .PERM) {
             err("namespace creation denied - in Docker, use: --security-opt seccomp=unconfined", .{});
         }
-        posix.exit(1);
+        std.process.exit(1);
     }
 
     // Set up uid/gid mappings for user namespace
     if (using_user_ns) {
         setupUidGidMappings(orig_uid, orig_gid) catch |ue| {
             err("uid/gid mapping failed: {}", .{ue});
-            posix.exit(1);
+            std.process.exit(1);
         };
     }
 
@@ -626,15 +825,16 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     if (pid != 0) {
         // Parent waits for child and exits with its status
         if (pid > 0) {
-            const child: i32 = @intCast(pid);
-            const status = posix.waitpid(child, 0).status;
-            if ((status & 0x7f) == 0) {
-                posix.exit(@truncate((status >> 8) & 0xff));
+            var status: i32 = 0;
+            _ = linux.waitpid(@intCast(pid), &status, 0);
+            const us: u32 = @bitCast(status);
+            if ((us & 0x7f) == 0) {
+                std.process.exit(@truncate((us >> 8) & 0xff));
             }
-            posix.exit(1);
+            std.process.exit(1);
         } else {
             err("fork failed", .{});
-            posix.exit(1);
+            std.process.exit(1);
         }
     }
 
@@ -648,7 +848,7 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     switch (setupOverlay(config, use_kernel_overlay)) {
         .err => |oe| {
             err("overlay setup failed: {}", .{oe});
-            posix.exit(1);
+            std.process.exit(1);
         },
         .ok => {},
     }
@@ -659,17 +859,18 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     // Execute command
     const argv = allocator.allocSentinel(?[*:0]const u8, config.command.len, null) catch {
         err("out of memory", .{});
-        posix.exit(1);
+        std.process.exit(1);
     };
     for (config.command, 0..) |arg, i| {
-        argv[i] = (allocator.dupeZ(u8, arg) catch {
+        argv[i] = (allocator.dupeSentinel(u8, arg, 0) catch {
             err("out of memory", .{});
-            posix.exit(1);
+            std.process.exit(1);
         }).ptr;
     }
 
-    const envp = @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
-    const exec_err = posix.execvpeZ(argv[0].?, argv, envp);
-    err("exec failed: {s}: {}", .{ config.command[0], exec_err });
-    posix.exit(127);
+    // execvp resolves argv[0] via PATH and inherits the current environ
+    // (which already has IS_SANDBOX=1 set above).
+    _ = execvp(argv[0].?, argv.ptr);
+    err("exec failed: {s}: {}", .{ config.command[0], c.errno(-1) });
+    std.process.exit(127);
 }

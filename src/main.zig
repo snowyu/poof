@@ -2,7 +2,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const fs = std.fs;
+const c = std.c;
 const options = @import("build_options");
 
 const output = @import("output.zig");
@@ -32,8 +32,8 @@ fn parseSize(s: []const u8) !u64 {
     if (s.len == 0) return error.InvalidSize;
 
     var num_end: usize = 0;
-    for (s) |c| {
-        if (c >= '0' and c <= '9') {
+    for (s) |ch| {
+        if (ch >= '0' and ch <= '9') {
             num_end += 1;
         } else {
             break;
@@ -57,9 +57,15 @@ fn parseSize(s: []const u8) !u64 {
     return num * multiplier;
 }
 
+fn clockSecs(clk: posix.clockid_t) ?i64 {
+    var ts = posix.timespec{ .sec = 0, .nsec = 0 };
+    const r = linux.clock_gettime(clk, &ts);
+    if (sandbox.errnoFromSyscall(r) != .SUCCESS) return null;
+    return ts.sec;
+}
+
 fn generateTimestamp() ![]const u8 {
-    const ts = try posix.clock_gettime(.REALTIME);
-    const secs: u64 = @intCast(ts.sec);
+    const secs: u64 = @intCast(clockSecs(posix.CLOCK.REALTIME) orelse return error.ClockError);
     const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
     const day = epoch.getDaySeconds();
     const yd = epoch.getEpochDay().calculateYearDay();
@@ -87,7 +93,7 @@ fn signalHandler(sig: linux.SIG) callconv(.c) void {
     if (child_pid > 0) {
         _ = linux.kill(child_pid, sig);
         // Wait for child to exit so mounts are cleaned up
-        var status: u32 = 0;
+        var status: i32 = 0;
         _ = linux.waitpid(child_pid, &status, 0);
     }
     // Cleanup cgroups and temp dirs
@@ -115,7 +121,7 @@ fn setupSignalHandlers() void {
 }
 
 fn reclaimTerminal() void {
-    if (!posix.isatty(posix.STDIN_FILENO)) return;
+    if (c.isatty(posix.STDIN_FILENO) != 1) return;
 
     // Block SIGTTOU/SIGTTIN while we reclaim the terminal
     // (calling tcsetpgrp from background can trigger these)
@@ -129,6 +135,29 @@ fn reclaimTerminal() void {
 
     // Restore original signal mask
     _ = linux.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
+}
+
+// Wait for a child; pid == 0 means "no state change" (W.NOHANG),
+// pid < 0 means the wait itself failed.
+const WaitResult = struct { pid: i32, status: u32 };
+
+fn waitChild(pid: i32, flags: u32) WaitResult {
+    var status: i32 = 0;
+    const r = linux.waitpid(pid, &status, flags);
+    if (sandbox.errnoFromSyscall(r) != .SUCCESS) return .{ .pid = -1, .status = 0 };
+    return .{ .pid = @intCast(r), .status = @bitCast(status) };
+}
+
+fn exitCodeFromStatus(status: u32) u8 {
+    if ((status & 0x7f) == 0) return @truncate((status >> 8) & 0xff);
+    if (((status & 0x7f) + 1) >> 1 > 0) return 128 + @as(u8, @truncate(status & 0x7f));
+    return 1;
+}
+
+fn readStdin(buf: []u8) ?usize {
+    const n = linux.read(posix.STDIN_FILENO, buf.ptr, buf.len);
+    if (sandbox.errnoFromSyscall(n) != .SUCCESS) return null;
+    return n;
 }
 
 const ChangeType = enum { added, edited, deleted };
@@ -152,11 +181,10 @@ const ChangeList = struct {
 
 // Recursively collect changed files in upper dir
 fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: []const u8, changes: *ChangeList) void {
-    var dir = fs.openDirAbsolute(upper_path, .{ .iterate = true }) catch return;
+    var dir = sandbox.DirStream.open(upper_path) orelse return;
     defer dir.close();
 
-    var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (dir.next()) |entry| {
         const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ upper_path, entry.name }) catch continue;
 
         // Build display path (relative to target)
@@ -167,9 +195,8 @@ fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: 
 
         if (entry.kind == .directory) {
             // Check if directory is empty (new empty dir) or has contents
-            var subdir = fs.openDirAbsolute(full_path, .{ .iterate = true }) catch continue;
-            var sub_iter = subdir.iterate();
-            const has_children = (sub_iter.next() catch null) != null;
+            var subdir = sandbox.DirStream.open(full_path) orelse continue;
+            const has_children = subdir.next() != null;
             subdir.close();
 
             if (has_children) {
@@ -186,9 +213,9 @@ fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: 
         } else {
             // Check if file exists in target (edited) or not (added)
             const target_path = std.fmt.allocPrint(allocator, "{s}{s}", .{ target_dir, display_path }) catch continue;
-            const change_type: ChangeType = if (fs.accessAbsolute(target_path, .{}))
+            const change_type: ChangeType = if (sandbox.pathExists(target_path))
                 .edited
-            else |_|
+            else
                 .added;
             changes.append(.{ .path = display_path, .change_type = change_type });
         }
@@ -244,7 +271,7 @@ fn handleEnterModeChanges(config: Config) void {
     const changes_path = std.fmt.allocPrint(allocator, "{s}{s}", .{ upper_dir, target_dir }) catch return;
 
     // Check if any changes exist
-    var dir = fs.openDirAbsolute(changes_path, .{ .iterate = true }) catch {
+    var dir = sandbox.DirStream.open(changes_path) orelse {
         success("No changes made to {s}", .{target_dir});
         return;
     };
@@ -252,8 +279,7 @@ fn handleEnterModeChanges(config: Config) void {
 
     // Count changes
     var change_count: usize = 0;
-    var iter = dir.iterate();
-    while (iter.next() catch null) |_| {
+    while (dir.next() != null) {
         change_count += 1;
     }
 
@@ -283,7 +309,7 @@ fn handleEnterModeChanges(config: Config) void {
 
     // Read user input
     var input_buf: [16]u8 = undefined;
-    const n = posix.read(posix.STDIN_FILENO, &input_buf) catch {
+    const n = readStdin(&input_buf) orelse {
         print("\n", .{});
         keepChanges(upper_dir);
         return;
@@ -298,15 +324,12 @@ fn handleEnterModeChanges(config: Config) void {
     } else if (std.mem.eql(u8, trimmed, "d") or std.mem.eql(u8, trimmed, "D") or std.mem.eql(u8, trimmed, "diff")) {
         // Show full diff (--no-pager to avoid "terminal not fully functional" issues)
         const full_diff_argv = [_][]const u8{ "git", "--no-pager", "diff", "--no-index", target_dir, changes_path };
-        var full_diff_proc = std.process.Child.init(&full_diff_argv, allocator);
-        full_diff_proc.stderr_behavior = .Inherit;
-        full_diff_proc.stdout_behavior = .Inherit;
-        _ = full_diff_proc.spawnAndWait() catch {};
+        _ = sandbox.runProcess(&full_diff_argv);
 
         // Prompt again
         print("\n{s}Apply these changes?{s} [y/N]: ", .{ c1, c2 });
         var input_buf2: [16]u8 = undefined;
-        const n2 = posix.read(posix.STDIN_FILENO, &input_buf2) catch {
+        const n2 = readStdin(&input_buf2) orelse {
             print("\n", .{});
             keepChanges(upper_dir);
             return;
@@ -338,18 +361,15 @@ fn applyChanges(source: []const u8, target: []const u8) void {
     // Use rsync to copy changes (handles deletions via whiteouts would need special handling)
     // For now, just copy the files
     const argv = [_][]const u8{ "cp", "-r", "-T", source, target };
-    var proc = std.process.Child.init(&argv, allocator);
-    proc.stderr_behavior = .Inherit;
-    proc.stdout_behavior = .Inherit;
-    const term = proc.spawnAndWait() catch {
+    const exit_code = sandbox.runProcess(&argv) orelse {
         err("Failed to apply changes", .{});
         return;
     };
 
-    if (term.Exited == 0) {
+    if (exit_code == 0) {
         success("Changes applied successfully", .{});
     } else {
-        err("Failed to apply changes (exit code {})", .{term.Exited});
+        err("Failed to apply changes (exit code {d})", .{exit_code});
     }
 }
 
@@ -410,51 +430,43 @@ pub fn run(config: Config) u8 {
 
         if (config.timeout) |timeout_secs| {
             // Get monotonic time for timeout tracking
-            const start_ts = posix.clock_gettime(.MONOTONIC) catch {
+            const start_sec = clockSecs(posix.CLOCK.MONOTONIC) orelse {
                 // Fall back to no timeout if clock fails
-                const status = posix.waitpid(child_pid, 0).status;
+                const result = waitChild(child_pid, 0);
                 sandbox.cleanupCgroup();
                 sandbox.cleanupOverlayDirs();
-                if ((status & 0x7f) == 0) return @truncate((status >> 8) & 0xff);
-                if (((status & 0x7f) + 1) >> 1 > 0) return 128 + @as(u8, @truncate(status & 0x7f));
-                return 1;
+                return exitCodeFromStatus(result.status);
             };
-            const deadline_sec: i64 = start_ts.sec + timeout_secs;
+            const deadline_sec: i64 = start_sec + timeout_secs;
 
             while (true) {
                 // Non-blocking wait
-                const result = posix.waitpid(child_pid, posix.W.NOHANG);
+                const result = waitChild(child_pid, linux.W.NOHANG);
+                if (result.pid < 0) continue; // wait failed (e.g. EINTR), retry
                 if (result.pid != 0) {
                     // Child exited
                     sandbox.cleanupCgroup();
                     sandbox.cleanupOverlayDirs();
-                    const status = result.status;
-                    if ((status & 0x7f) == 0) {
-                        return @truncate((status >> 8) & 0xff);
-                    }
-                    if (((status & 0x7f) + 1) >> 1 > 0) {
-                        return 128 + @as(u8, @truncate(status & 0x7f));
-                    }
-                    return 1;
+                    return exitCodeFromStatus(result.status);
                 }
 
                 // Check timeout
-                const now_ts = posix.clock_gettime(.MONOTONIC) catch continue;
-                if (now_ts.sec >= deadline_sec) {
+                const now_sec = clockSecs(posix.CLOCK.MONOTONIC) orelse continue;
+                if (now_sec >= deadline_sec) {
                     warn("timeout after {d}s, killing process", .{timeout_secs});
                     _ = linux.kill(child_pid, linux.SIG.KILL);
-                    _ = posix.waitpid(child_pid, 0);
+                    _ = waitChild(child_pid, 0);
                     sandbox.cleanupCgroup();
                     sandbox.cleanupOverlayDirs();
                     return 124; // Standard timeout exit code
                 }
 
                 // Sleep briefly before checking again (10ms)
-                posix.nanosleep(0, 10_000_000);
+                sandbox.sleepNs(0, 10_000_000);
             }
         } else {
             // No timeout - blocking wait
-            const status = posix.waitpid(child_pid, 0).status;
+            const result = waitChild(child_pid, 0);
             sandbox.cleanupCgroup();
 
             // Handle interactive mode - prompt to apply changes before cleanup
@@ -464,13 +476,7 @@ pub fn run(config: Config) u8 {
 
             sandbox.cleanupOverlayDirs();
 
-            if ((status & 0x7f) == 0) {
-                return @truncate((status >> 8) & 0xff);
-            }
-            if (((status & 0x7f) + 1) >> 1 > 0) {
-                return 128 + @as(u8, @truncate(status & 0x7f));
-            }
-            return 1;
+            return exitCodeFromStatus(result.status);
         }
     } else {
         err("fork failed: {}", .{sandbox.errnoFromSyscall(pid)});
@@ -478,6 +484,14 @@ pub fn run(config: Config) u8 {
         sandbox.cleanupOverlayDirs();
         return 1;
     }
+}
+
+fn getHostCwd(buf: []u8) []const u8 {
+    _ = c.getcwd(buf.ptr, buf.len) orelse return "/";
+    for (buf, 0..) |ch, i| {
+        if (ch == 0) return buf[0..i];
+    }
+    return "/";
 }
 
 fn printVersion() void {
@@ -622,10 +636,10 @@ fn printUsage() void {
     , .{ B, R, D, R, D, R, D, R, D, R, D, R, Y, R, D, R, G, R });
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
     output.init();
 
-    const args = std.process.argsAlloc(allocator) catch {
+    const args = std.process.Args.toSlice(init.args, allocator) catch {
         err("out of memory", .{});
         return 1;
     };
@@ -636,7 +650,7 @@ pub fn main() u8 {
     }
 
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = posix.getcwd(&cwd_buf) catch "/";
+    const cwd = getHostCwd(&cwd_buf);
 
     var config = Config{
         .mode = .exec,
@@ -724,7 +738,7 @@ pub fn main() u8 {
 
     // Handle enter mode specially - uses $SHELL, no command needed
     if (config.mode == .enter) {
-        const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
+        const shell = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else "/bin/sh";
         const shell_args = allocator.alloc([]const u8, 1) catch {
             err("out of memory", .{});
             return 1;
@@ -748,7 +762,7 @@ pub fn main() u8 {
 
     // Determine upper directory for run mode
     if (config.mode == .run) {
-        const is_interactive = std.posix.isatty(std.posix.STDIN_FILENO);
+        const is_interactive = std.c.isatty(std.posix.STDIN_FILENO) == 1;
 
         if (upper_dir) |dir| {
             // --upper explicitly provided: persist changes there
@@ -776,7 +790,7 @@ pub fn main() u8 {
             };
 
             // Check if base path exists, if so append timestamp
-            if (std.fs.accessAbsolute(base_path, .{})) |_| {
+            if (sandbox.pathExists(base_path)) {
                 const ts = generateTimestamp() catch {
                     err("clock error", .{});
                     return 1;
@@ -785,7 +799,7 @@ pub fn main() u8 {
                     err("out of memory", .{});
                     return 1;
                 };
-            } else |_| {
+            } else {
                 config.upper_dir = base_path;
             }
 
