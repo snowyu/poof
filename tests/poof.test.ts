@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { spawn, spawnSync } from "bun";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, readdirSync } from "fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, readdirSync, statSync, lstatSync, readlinkSync } from "fs";
 import { join } from "path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -1110,6 +1110,109 @@ describe("poof CLI", () => {
 
       expect(existsSync(testFile)).toBe(true);
       expect(readFileSync(testFile, "utf-8").trim()).toBe("applied");
+    });
+
+    test("applying replays deletions instead of copying whiteouts", async () => {
+      const doomed = join(runDir, "doomed.txt");
+      const kept = join(runDir, "kept.txt");
+      writeFileSync(doomed, "remove me\n");
+      writeFileSync(kept, "keep me\n");
+
+      const session = new TerminalSession(
+        runDir, undefined, ["sh", "-c", `rm ${doomed}`], "run");
+
+      await session.waitForNew("[y/N/d(iff)]");
+      expect(session.output).toContain("doomed.txt");
+
+      session.write("y\n");
+      await session.waitFor("Changes applied");
+      await session.waitForExit();
+
+      // A deletion inside the sandbox is an overlay whiteout (a 0:0 character
+      // device in the upper dir). It must become a real deletion in the target,
+      // not a device node copied into it.
+      expect(existsSync(doomed)).toBe(false);
+      expect(readFileSync(kept, "utf-8").trim()).toBe("keep me");
+    });
+
+    test("applying preserves file modes", async () => {
+      const script = join(runDir, "mode.sh");
+      writeFileSync(script, "#!/bin/sh\necho hi\n");
+
+      const session = new TerminalSession(
+        runDir, undefined, ["sh", "-c", `chmod 750 ${script}`], "run");
+
+      await session.waitForNew("[y/N/d(iff)]");
+      session.write("y\n");
+      await session.waitFor("Changes applied");
+      await session.waitForExit();
+
+      expect(statSync(script).mode & 0o777).toBe(0o750);
+    });
+
+    test("applying recreates symlinks as symlinks", async () => {
+      const link = join(runDir, "link-to-nothing");
+
+      const session = new TerminalSession(
+        runDir, undefined, ["sh", "-c", `ln -s /does-not-exist ${link}`], "run");
+
+      await session.waitForNew("[y/N/d(iff)]");
+      session.write("y\n");
+      await session.waitFor("Changes applied");
+      await session.waitForExit();
+
+      expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(link)).toBe("/does-not-exist");
+    });
+
+    test("applying creates missing subdirectories and replays edits", async () => {
+      const nested = join(runDir, "sub/deep/nested.txt");
+      const edited = join(runDir, "edited.txt");
+      writeFileSync(edited, "v1\n");
+
+      const session = new TerminalSession(
+        runDir, undefined,
+        ["sh", "-c", `mkdir -p ${join(runDir, "sub/deep")} && echo v2 > ${nested} && echo v2 > ${edited}`],
+        "run");
+
+      await session.waitForNew("[y/N/d(iff)]");
+      session.write("y\n");
+      await session.waitFor("Changes applied");
+      await session.waitForExit();
+
+      expect(readFileSync(nested, "utf-8").trim()).toBe("v2");
+      expect(readFileSync(edited, "utf-8").trim()).toBe("v2");
+    });
+
+    test("applying creates a directory that is empty inside the sandbox", async () => {
+      const session = new TerminalSession(
+        runDir, undefined, ["sh", "-c", `mkdir -p ${join(runDir, "empty-dir")}`], "run");
+
+      await session.waitForNew("[y/N/d(iff)]");
+      expect(session.output).toContain("empty-dir/");
+
+      session.write("y\n");
+      await session.waitFor("Changes applied");
+      await session.waitForExit();
+
+      expect(statSync(join(runDir, "empty-dir")).isDirectory()).toBe(true);
+    });
+
+    test("the change summary ignores overlay bookkeeping markers", async () => {
+      const session = new TerminalSession(
+        runDir, undefined,
+        ["sh", "-c", `mkdir -p ${join(runDir, "newdir/deeper")} && echo x > ${join(runDir, "newdir/deeper/f.txt")}`],
+        "run");
+
+      await session.waitForNew("[y/N/d(iff)]");
+      // A directory created inside the sandbox carries .wh..wh..opq / .wh..opq
+      // markers in the upper dir; they are not user changes.
+      expect(session.output).not.toContain(".wh.");
+      expect(session.output).toContain("1 changed file");
+
+      session.write("n\n");
+      await session.waitForExit();
+      cleanupStash(session.output);
     });
 
     test("discards on n but keeps the stash", async () => {

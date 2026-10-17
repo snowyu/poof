@@ -167,6 +167,74 @@ fn readStdin(buf: []u8) ?usize {
     return n;
 }
 
+fn zPath(path: []const u8) ?[*:0]const u8 {
+    return allocator.dupeSentinel(u8, path, 0) catch return null;
+}
+
+// lstat without std.posix: its stat helpers sit behind std.Io in this Zig
+// release, so use statx with AT.SYMLINK_NOFOLLOW directly.
+const FileInfo = struct {
+    mode: u32,
+    is_link: bool,
+    is_reg: bool,
+    is_char: bool,
+    is_whiteout_dev: bool, // character device 0:0, i.e. an overlay whiteout
+};
+
+fn fileInfo(path_z: [*:0]const u8) ?FileInfo {
+    var sx: linux.Statx = undefined;
+    const r = linux.statx(linux.AT.FDCWD, path_z, linux.AT.SYMLINK_NOFOLLOW, .BASIC_STATS, &sx);
+    if (sandbox.errnoFromSyscall(r) != .SUCCESS) return null;
+    const mode: u32 = sx.mode;
+    return .{
+        .mode = mode,
+        .is_link = linux.S.ISLNK(mode),
+        .is_reg = linux.S.ISREG(mode),
+        .is_char = linux.S.ISCHR(mode),
+        .is_whiteout_dev = sx.rdev_major == 0 and sx.rdev_minor == 0,
+    };
+}
+
+// Overlay whiteouts: a file deleted inside the sandbox is recorded in the upper
+// dir as a character device with rdev 0 (both the kernel driver and
+// fuse-overlayfs do this), or as a regular file named ".wh.<name>". A real
+// character device created by the sandboxed program has a non-zero rdev, so the
+// two are told apart by rdev.
+fn whiteoutName(name: []const u8) ?[]const u8 {
+    if (name.len <= 4) return null;
+    if (!std.mem.startsWith(u8, name, ".wh.")) return null;
+    return name[4..];
+}
+
+// fuse-overlayfs bookkeeping that must never be replayed onto the target:
+// ".wh..wh..opq" (opaque-dir marker, regular file), ".wh..opq" (the same marker
+// as a 0:0 char device) and friends.
+fn isOverlayMarker(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, ".wh..wh.")) return true;
+    return std.mem.eql(u8, name, ".wh..opq");
+}
+
+// A directory the sandbox created is marked opaque: its contents replace the
+// target directory's contents entirely. readdir hands the marker back in
+// arbitrary order, so it has to be looked for before the contents are replayed.
+fn hasOpaqueMarker(src_dir: []const u8) bool {
+    var dir = sandbox.DirStream.open(src_dir) orelse return false;
+    defer dir.close();
+    while (dir.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, ".wh..wh..opq") or std.mem.eql(u8, entry.name, ".wh..opq")) return true;
+    }
+    return false;
+}
+
+fn isWhiteout(entry_kind: sandbox.DirEntryKind, stat: ?FileInfo) bool {
+    if (stat) |fi| {
+        if (fi.is_char) return fi.is_whiteout_dev;
+        return false;
+    }
+    // statx unavailable (pre-4.11 kernel): fall back to the dirent type.
+    return entry_kind == .character_device;
+}
+
 const ChangeType = enum { added, edited, deleted };
 
 const Change = struct {
@@ -186,12 +254,26 @@ const ChangeList = struct {
     }
 };
 
+// True when the directory holds at least one entry that is not overlay
+// bookkeeping.
+fn dirHasRealEntries(path: []const u8) bool {
+    var dir = sandbox.DirStream.open(path) orelse return false;
+    defer dir.close();
+    while (dir.next()) |entry| {
+        if (isOverlayMarker(entry.name)) continue;
+        return true;
+    }
+    return false;
+}
+
 // Recursively collect changed files in upper dir
 fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: []const u8, changes: *ChangeList) void {
     var dir = sandbox.DirStream.open(upper_path) orelse return;
     defer dir.close();
 
     while (dir.next()) |entry| {
+        if (isOverlayMarker(entry.name)) continue;
+
         const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ upper_path, entry.name }) catch continue;
 
         // Build display path (relative to target)
@@ -201,10 +283,9 @@ fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: 
             full_path;
 
         if (entry.kind == .directory) {
-            // Check if directory is empty (new empty dir) or has contents
-            var subdir = sandbox.DirStream.open(full_path) orelse continue;
-            const has_children = subdir.next() != null;
-            subdir.close();
+            // A directory the sandbox created holds only overlay markers until
+            // something is put inside it, so "empty" has to ignore those.
+            const has_children = dirHasRealEntries(full_path);
 
             if (has_children) {
                 // Recurse into subdirectories with contents
@@ -214,9 +295,19 @@ fn collectChanges(upper_path: []const u8, target_dir: []const u8, strip_prefix: 
                 const path_with_slash = std.fmt.allocPrint(allocator, "{s}/", .{display_path}) catch continue;
                 changes.append(.{ .path = path_with_slash, .change_type = .added });
             }
-        } else if (entry.kind == .character_device) {
+        } else if (entry.kind == .character_device or whiteoutName(entry.name) != null) {
             // Whiteout - file was deleted
-            changes.append(.{ .path = display_path, .change_type = .deleted });
+            const is_marker = blk: {
+                if (whiteoutName(entry.name) != null) break :blk true;
+                const src_z = zPath(full_path) orelse break :blk true;
+                const fi = fileInfo(src_z) orelse break :blk true;
+                break :blk fi.is_whiteout_dev;
+            };
+            if (is_marker) {
+                changes.append(.{ .path = display_path, .change_type = .deleted });
+            } else {
+                changes.append(.{ .path = display_path, .change_type = .added });
+            }
         } else {
             // Check if file exists in target (edited) or not (added)
             const target_path = std.fmt.allocPrint(allocator, "{s}{s}", .{ target_dir, display_path }) catch continue;
@@ -377,21 +468,174 @@ fn keepChanges(upper_dir: []const u8) void {
     print("{s}Stashed changes in{s} {s}\n", .{ dim, r, upper_dir });
 }
 
+const ApplyStats = struct {
+    applied: usize = 0,
+    failed: usize = 0,
+};
+
+// Remove a destination entry without following symlinks out of the target tree.
+fn removeTarget(path: []const u8) void {
+    const z = zPath(path) orelse return;
+    if (fileInfo(z)) |fi| {
+        if (fi.is_link) {
+            _ = linux.unlink(z);
+            return;
+        }
+    }
+    sandbox.deleteTree(path);
+}
+
+// An opaque overlay directory (".wh..wh..opq") replaces the target directory's
+// contents entirely.
+fn clearDir(dir_path: []const u8, stats: *ApplyStats) void {
+    var dir = sandbox.DirStream.open(dir_path) orelse return;
+    defer dir.close();
+    while (dir.next()) |entry| {
+        const child = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        removeTarget(child);
+        stats.applied += 1;
+    }
+}
+
+fn copyFile(src_z: [*:0]const u8, dst_z: [*:0]const u8, mode: u32, stats: *ApplyStats) void {
+    const opened = linux.open(src_z, .{ .ACCMODE = .RDONLY }, 0);
+    if (sandbox.errnoFromSyscall(opened) != .SUCCESS) {
+        err("cannot read {s}", .{src_z});
+        stats.failed += 1;
+        return;
+    }
+    const src_fd: posix.fd_t = @intCast(opened);
+    defer _ = linux.close(src_fd);
+
+    // Replace whatever is at the destination so a stale entry of another type
+    // cannot survive the apply.
+    _ = linux.unlink(dst_z);
+    const created = linux.open(
+        dst_z,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true },
+        @truncate(mode & 0o7777),
+    );
+    if (sandbox.errnoFromSyscall(created) != .SUCCESS) {
+        err("cannot write {s}", .{dst_z});
+        stats.failed += 1;
+        return;
+    }
+    const dst_fd: posix.fd_t = @intCast(created);
+    defer _ = linux.close(dst_fd);
+
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = linux.read(src_fd, &buf, buf.len);
+        if (sandbox.errnoFromSyscall(n) != .SUCCESS) {
+            err("read failed: {s}", .{src_z});
+            stats.failed += 1;
+            return;
+        }
+        if (n == 0) break;
+        var off: usize = 0;
+        while (off < n) {
+            const w = linux.write(dst_fd, buf[off..n].ptr, n - off);
+            if (sandbox.errnoFromSyscall(w) != .SUCCESS) {
+                err("write failed: {s}", .{dst_z});
+                stats.failed += 1;
+                return;
+            }
+            off += w;
+        }
+    }
+
+    // open() applies the umask; restore the mode the sandboxed process saw.
+    _ = linux.fchmod(dst_fd, @truncate(mode & 0o7777));
+    stats.applied += 1;
+}
+
+// Walk the upper dir and replay it onto the target: whiteouts become deletions,
+// directories are created and recursed, symlinks are recreated as symlinks and
+// regular files are copied with their mode. `cp -r` cannot do any of the first
+// two, which is why this is hand rolled.
+fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats) void {
+    var dir = sandbox.DirStream.open(src_dir) orelse {
+        err("cannot read changes in {s}", .{src_dir});
+        stats.failed += 1;
+        return;
+    };
+    defer dir.close();
+
+    if (!sandbox.pathExists(dst_dir)) {
+        sandbox.makeDirs(dst_dir) catch |e| {
+            err("cannot create {s}: {}", .{ dst_dir, e });
+            stats.failed += 1;
+            return;
+        };
+    }
+
+    if (hasOpaqueMarker(src_dir)) clearDir(dst_dir, stats);
+
+    while (dir.next()) |entry| {
+        // Overlay bookkeeping, never user data.
+        if (isOverlayMarker(entry.name)) continue;
+
+        const src_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ src_dir, entry.name }) catch continue;
+        const src_z = zPath(src_path) orelse continue;
+
+        const fi = fileInfo(src_z);
+
+        var dst_name: []const u8 = entry.name;
+        if (whiteoutName(entry.name)) |base| dst_name = base;
+        if (dst_name.len == 0) continue;
+        const dst_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_dir, dst_name }) catch continue;
+        const dst_z = zPath(dst_path) orelse continue;
+
+        if (isWhiteout(entry.kind, fi)) {
+            removeTarget(dst_path);
+            stats.applied += 1;
+            continue;
+        }
+
+        if (entry.kind == .directory) {
+            applyTree(src_path, dst_path, stats);
+            continue;
+        }
+
+        if (fi != null and fi.?.is_link) {
+            var link_buf: [4096]u8 = undefined;
+            const n = linux.readlinkat(linux.AT.FDCWD, src_z, &link_buf, link_buf.len);
+            if (sandbox.errnoFromSyscall(n) != .SUCCESS or n == 0 or n > link_buf.len) {
+                err("cannot read symlink {s}", .{src_z});
+                stats.failed += 1;
+                continue;
+            }
+            const link = allocator.dupeSentinel(u8, link_buf[0..n], 0) catch continue;
+            removeTarget(dst_path);
+            if (sandbox.errnoFromSyscall(linux.symlinkat(link, linux.AT.FDCWD, dst_z)) != .SUCCESS) {
+                err("cannot create symlink {s}", .{dst_z});
+                stats.failed += 1;
+                continue;
+            }
+            stats.applied += 1;
+            continue;
+        }
+
+        if (fi != null and fi.?.is_reg) {
+            copyFile(src_z, dst_z, fi.?.mode, stats);
+            continue;
+        }
+
+        warn("skipping unsupported file type: {s}", .{src_path});
+        stats.failed += 1;
+    }
+}
+
 fn applyChanges(source: []const u8, target: []const u8) void {
     step("Applying changes to {s}", .{target});
 
-    // Use rsync to copy changes (handles deletions via whiteouts would need special handling)
-    // For now, just copy the files
-    const argv = [_][]const u8{ "cp", "-r", "-T", source, target };
-    const exit_code = sandbox.runProcess(&argv) orelse {
-        err("Failed to apply changes", .{});
-        return;
-    };
+    var stats = ApplyStats{};
+    applyTree(source, target, &stats);
 
-    if (exit_code == 0) {
-        success("Changes applied successfully", .{});
+    if (stats.failed == 0) {
+        success("Changes applied successfully ({d})", .{stats.applied});
     } else {
-        err("Failed to apply changes (exit code {d})", .{exit_code});
+        err("applied {d} change(s), {d} failed", .{ stats.applied, stats.failed });
     }
 }
 

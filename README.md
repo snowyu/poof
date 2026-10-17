@@ -475,7 +475,11 @@ For each file in upperdir:
   - Empty directory → "added directory" (green +)
 ```
 
-If you confirm with 'y', poof copies the upperdir contents over the target directory using `cp -r`.
+If you confirm with 'y', poof replays the upperdir onto the target instead of copying it:
+whiteouts become real deletions, missing directories are created, symlinks are
+recreated as symlinks, and regular files are copied with their mode. Overlay
+bookkeeping (`.wh..wh..opq`, `.wh..opq`) is never copied, and a directory the
+sandbox created replaces the target directory's contents (opaque marker).
 
 ---
 
