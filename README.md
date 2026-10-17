@@ -388,6 +388,8 @@ Deleting a file:
 
 In `exec` mode, upperdir is on a tmpfs — when the namespace exits, the tmpfs is destroyed and all changes vanish.
 
+In `run`/`enter` mode upperdir is the user's own directory and workdir sits beside it (`<upper>.work`, required to be on the same filesystem as upperdir), but the merged mount point is placed inside a private tmpfs under `/tmp` instead. The sandbox never sees the path the overlay is mounted at — that keeps fuse-overlayfs from resolving its own mount point when a sandboxed process walks the tree around it.
+
 ### Namespace Isolation
 
 | Namespace | What it isolates | Effect in poof |

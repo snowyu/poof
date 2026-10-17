@@ -313,18 +313,20 @@ pub fn setupUidGidMappings(uid: u32, gid: u32) !void {
 // Cleanup paths (set during setupOverlay, cleaned by parent after child exits)
 pub var cleanup_temp_base: ?[]const u8 = null; // exec/enter mode: temp dir to delete
 pub var cleanup_work_dir: ?[]const u8 = null; // run mode: .work dir to delete
-pub var cleanup_merged_dir: ?[]const u8 = null; // run mode: .merged dir to delete
+pub var cleanup_merged_base: ?[]const u8 = null; // run/enter mode: temp dir hosting the merged mount point
 
 pub fn cleanupOverlayDirs() void {
     // Delete temp base directory (exec and enter modes)
     if (cleanup_temp_base) |path| {
         deleteTree(path);
     }
-    // Run mode: delete the .work and .merged directories we created
+    // Run mode: delete the .work directory we created next to the user's upper dir
     if (cleanup_work_dir) |path| {
         deleteTree(path);
     }
-    if (cleanup_merged_dir) |path| {
+    // Run/enter mode: the empty dir that hosted the merged mount point. Its contents
+    // lived on a tmpfs that died together with the child's mount namespace.
+    if (cleanup_merged_base) |path| {
         deleteTree(path);
     }
 }
@@ -455,6 +457,10 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
     const pid = linux.fork();
     if (pid == 0) {
         // Child - exec fuse-overlayfs in foreground
+        // PDEATHSIG survives execve, so the daemon goes away together with the
+        // sandboxed process instead of lingering with the FUSE connection and our
+        // inherited stdio pipes held open.
+        _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(usize, @backingInt(linux.SIG.KILL)), 0, 0, 0);
         const argv = [_:null]?[*:0]const u8{
             "fuse-overlayfs",
             "-f", // foreground mode - required for chroot to work
@@ -604,11 +610,31 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         work_dir = std.fmt.allocPrint(allocator, "{s}/work", .{temp_base}) catch return .{ .err = .NOMEM };
         merged_dir = std.fmt.allocPrint(allocator, "{s}/merged", .{temp_base}) catch return .{ .err = .NOMEM };
     } else {
-        // Run mode: upper is user-specified, work/merged must be on same filesystem
+        // Run/enter mode: upper is user-specified and must persist, and work has to sit
+        // on the same filesystem as upper (kernel overlay requirement). The merged mount
+        // point must NOT be reachable from inside the sandbox: when anything walks the
+        // directory holding it, fuse-overlayfs ends up opening its own mount point and
+        // deadlocks. So merged lives under a private tmpfs in /tmp - the fresh /tmp we
+        // mount after chroot/pivot_root hides it, same layout that makes exec mode safe.
         upper_dir = config.upper_dir.?;
         work_dir = std.fmt.allocPrint(allocator, "{s}.work", .{upper_dir}) catch return .{ .err = .NOMEM };
-        merged_dir = std.fmt.allocPrint(allocator, "{s}.merged", .{upper_dir}) catch return .{ .err = .NOMEM };
-        // cleanup_work_dir and cleanup_merged_dir are set by parent before fork
+
+        temp_base = cleanup_merged_base orelse {
+            err("merged temp base not set up", .{});
+            return .{ .err = .NOENT };
+        };
+        const merged_base_z = allocator.dupeSentinel(u8, temp_base, 0) catch return .{ .err = .NOMEM };
+        switch (mount("tmpfs", merged_base_z.ptr, "tmpfs", 0, null)) {
+            .err => |e| {
+                err("tmpfs mount for merged dir failed: {}", .{e});
+                return .{ .err = e };
+            },
+            .ok => {},
+        }
+        log("tmpfs mounted for merged mount point", .{});
+
+        merged_dir = std.fmt.allocPrint(allocator, "{s}/merged", .{temp_base}) catch return .{ .err = .NOMEM };
+        // cleanup_work_dir and cleanup_merged_base are set by parent before fork
     }
 
     // Create directories
@@ -839,6 +865,12 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     }
 
     // Now we're PID 1 in the new namespace
+    // PDEATHSIG is not inherited across fork, so set it again here: it survives execve,
+    // which means the sandboxed command dies together with this namespace's parent when
+    // poof times out or gets interrupted. Without it the command (and the FUSE daemon it
+    // spawned) outlives the sandbox and keeps inherited file descriptors open.
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(usize, @backingInt(linux.SIG.KILL)), 0, 0, 0);
+
     log("entered namespaces (PID={})", .{linux.getpid()});
     vstep("Namespace isolation active", .{});
 

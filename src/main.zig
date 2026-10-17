@@ -349,7 +349,7 @@ fn keepChanges(upper_dir: []const u8) void {
     // Don't delete the temp dir - user wants to keep it
     sandbox.cleanup_temp_base = null;
     sandbox.cleanup_work_dir = null;
-    sandbox.cleanup_merged_dir = null;
+    // cleanup_merged_base stays: it only ever holds the overlay mount point, never user data
     const dim = col(Color.dim);
     const r = col(Color.reset);
     print("{s}Stashed changes in{s} {s}\n", .{ dim, r, upper_dir });
@@ -405,9 +405,14 @@ pub fn run(config: Config) u8 {
             return 1;
         };
     } else if (config.mode == .run or config.mode == .enter) {
-        // For run/enter: set up paths for .work and .merged cleanup
+        // For run/enter: .work sits next to the user's upper dir (kernel overlay wants
+        // upper and work on one filesystem); the merged mount point goes into a private
+        // temp base so it stays invisible from inside the sandbox.
         sandbox.cleanup_work_dir = std.fmt.allocPrint(allocator, "{s}.work", .{config.upper_dir.?}) catch null;
-        sandbox.cleanup_merged_dir = std.fmt.allocPrint(allocator, "{s}.merged", .{config.upper_dir.?}) catch null;
+        sandbox.cleanup_merged_base = sandbox.makeTempDir() catch |e| {
+            err("makeTempDir: {}", .{e});
+            return 1;
+        };
         // For enter mode (and interactive run), also clean up the temp upper dir
         if (config.enter_target != null) {
             sandbox.cleanup_temp_base = config.upper_dir;
