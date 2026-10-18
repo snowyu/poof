@@ -28,6 +28,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("diffz");
 
+    // zglob: the glob matcher behind an apply report (`poof apply --from=<report>`).
+    // Vendored rather than fetched (vendor/zglob/VENDOR.md): upstream targets an
+    // older Zig and needs a one-line port, and the target needs no network at
+    // build time.
+    const zglob = b.createModule(.{
+        .root_source_file = b.path("vendor/zglob/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_commit", git_commit);
@@ -45,6 +55,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addOptions("build_options", options);
     exe.root_module.addImport("diffz", diffz);
+    exe.root_module.addImport("zglob", zglob);
 
     b.installArtifact(exe);
 
@@ -59,6 +70,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("diffz", diffz);
+    tests.root_module.addImport("zglob", zglob);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

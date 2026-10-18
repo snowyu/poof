@@ -81,6 +81,9 @@ pub const Config = struct {
     // The directory an exit-time apply writes into. Null means no exit-time apply:
     // the stash is left for `poof apply <stash>` instead.
     apply_target: ?[]const u8 = null,
+    // --report=<file>: write the session's change list where the user can read it
+    // back with `poof apply --from=<file>`.
+    report_path: ?[]const u8 = null,
 };
 
 // ============================================================================

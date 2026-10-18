@@ -199,6 +199,9 @@ poof apply /tmp/poof-4f2a9c1b7d3e8a55
 poof apply /tmp/poof-4f2a9c1b7d3e8a55 --yes   # no prompt, for scripts
 poof --apply=/tmp/poof-4f2a9c1b7d3e8a55 --yes
 # a stash that applies in full is removed; a partial failure keeps it for a retry
+
+poof apply /tmp/poof-4f2a9c1b7d3e8a55 --dry-run   # the same list, nothing written
+poof apply /tmp/poof-4f2a9c1b7d3e8a55 --report=plan.txt   # the same list, as a file
 ```
 
 Because a stash mirrors absolute paths, `<stash>/home/me/proj/x.c` applies to
@@ -214,6 +217,70 @@ recreated `del.txt`; after `poof apply` the file holds the session's version and
 `del.txt` is gone again. Review the list (or `poof apply` without `--yes`) before
 applying a stash onto a tree that has moved on.
 
+### `--dry-run` and reports — the interaction written down
+
+`--dry-run` prints the change list and stops: nothing is written anywhere, and the
+stash is left where it is. It needs no terminal and no `--yes`, which makes it the
+way to look at a stash from a script.
+
+`--report=<file>` writes that same list out as a *report* — plain text, meant to be
+edited:
+
+```text
+@stash /tmp/poof-4f2a9c1b7d3e8a55
+@target /
+@mode applied
+@changed 3
+@time 1760000000
+
++ home/me/proj/new-file.txt
+~ home/me/proj/modified.txt
+- home/me/proj/deleted.txt
+```
+
+`poof apply --from=<file>` replays it. The `@stash` line is why no stash argument is
+needed: poof already knew where the changes lived, so the report says so (a stash on
+the command line overrides it, which is how one report gets replayed against another
+copy of the changes). `@target` is replayed the same way; a hand-written report with
+neither needs the stash given: `poof apply --from=<file> <stash>`.
+
+The lines are not fixed paths — each is a shell glob over the paths relative to
+`@target`, so it can select more than the change it was written from:
+
+```bash
+poof apply /tmp/poof-4f2a9c1b7d3e8a55 --dry-run --report=plan.txt
+# then edit plan.txt:
+#   src/**/*.c            # added/edited anywhere under src, at any depth
+#   ! src/vendor/**       # ... except vendored files
+poof apply --from=plan.txt --yes
+#   poof: report selects 7 of 12 change(s)
+```
+
+`*` stops at `/`, `**/` spans directories (zero directories too, so `src/**/*.c`
+covers `src/a.c`), `{a,b}` and `[a-z]` work as in a shell, and a leading dot is not
+special: `src/*` covers `src/.hidden`. `src/**` reaches everything under `src` at any
+depth, but not `src` itself: the entries are the files and directories the session put
+there, so a directory only has a line of its own when it arrived empty (printed with a
+trailing `/`, matched without one).
+A line starting with `!` excludes; a report containing only `!` lines starts from
+everything in the stash and subtracts, which is the quick way to apply most of a
+stash. `@mode` records what had already happened when the report was written
+(`applied`, `dry-run`, or `kept` for a session whose changes were left in the stash).
+
+A filtered apply brings over exactly what the report selects and nothing around it:
+a directory whose files were all excluded does not appear on the target empty, and a
+directory the session *replaced* is not cleared on the target — clearing it would
+delete the files the report left out, which poof was never asked to remove. A report
+that turns out to leave nothing out is no filter at all: that apply replaces a
+replaced directory exactly as a plain `poof apply <stash>` does. And because a
+filtered report deliberately left changes behind, the stash that holds them is kept
+rather than removed — replay the rest with another report, or drop it yourself.
+
+On the session side `--report=<file>` records the changes as the session ends — after
+`--yes` or a `y` at the prompt, and on `n` too, where `@mode kept` marks it as a plan
+for `poof apply --from=<file>` later. It cannot be combined with `--no-keep`, which
+destroys the very changes the report would point at.
+
 ---
 
 ## Options
@@ -227,6 +294,7 @@ applying a stash onto a tree that has moved on.
 | `--no-keep` | Destroy the changes when the command exits |
 | `--yes` | Apply the changes as the command exits; also confirms `poof apply` without prompting |
 | `--apply=<stash>` | Replay a saved stash onto the host (no sandbox started) |
+| `--report=<file>` | Write the change list to `<file>` as a report `poof apply --from=<file>` can replay |
 | `--timeout=<secs>` | Kill process after N seconds (exit code 124) |
 | `--memory=<size>` | Memory limit, e.g. `100M`, `1G` |
 | `--pids=<max>` | Max processes (fork bomb protection, minimum 2) |
@@ -711,7 +779,13 @@ CHANGES
   --no-keep      destroy them when the command exits
   --keep=<dir>   keep them in <dir> instead of a /tmp stash
   --yes          apply them to the real directory as the command exits
+  --report=<f>   also write the change list to f, to replay later
   Either way the prompt accepts d for a diff of exactly those changes.
+
+COMMANDS
+  apply <stash>              Replay a saved stash onto the host
+  apply --from=<report>      Replay only what a report selects
+  stash list                 List stashes left in /tmp
 
 EXAMPLES
   $ poof bun install              # kept; replay with poof apply
@@ -754,22 +828,40 @@ poof apply — Replay a saved upper dir (stash) onto the host
 
 USAGE
   poof apply [options] <stash>
-  poof --apply=<stash>         the same, script-friendly
+  poof --apply=<stash>        the same, script-friendly
+  poof apply --from=<report>  replay what a report selects
 
 EXAMPLES
   $ poof stash list                  # find stashes
   $ poof apply /tmp/poof-3f9a2b      # preview, then confirm
-  $ poof apply /tmp/poof-3f9a2b --yes
+  $ poof apply /tmp/poof-3f9a2b --yes --report=done.txt
+  $ poof apply /tmp/poof-3f9a2b --dry-run --report=plan.txt
+  $ poof apply --from=plan.txt       # plan.txt says which stash
 
 NOTES
   A stash mirrors absolute paths, so <stash>/home/me/proj/x.c applies
   to /home/me/proj/x.c. Deletions are replayed as deletions (overlay
   whiteouts), file modes and symlinks are preserved.
   Applying writes straight to the filesystem: the change list is shown
-  first and confirmation is required unless --yes is given.
+  first and confirmation is required unless --yes is given. A stash that
+  applies in full is removed; a partial failure keeps it for a retry.
+
+REPORTS
+  --report=<file> writes the changes this apply dealt with: a header
+  naming the stash (@stash) and target (@target), then one line per
+  change - + added, ~ edited, - deleted. It is text meant to be edited:
+  widen a path into a glob (src/**/*.c), delete the lines you do not
+  want, add `! src/vendor/**` to keep something out - then apply the
+  result with `poof apply --from=<file>`. Patterns are shell globs over
+  the paths above, so * stops at / and **/ spans directories. A report
+  with only ! lines starts from everything and subtracts; a filtered
+  apply keeps the stash, so what it left out is still there.
 
 OPTIONS
   --yes                      Apply without prompting
+  --dry-run                  Show the changes, write nothing
+  --report=<file>            Record the changes as a report
+  --from=<report>            Apply only what a report selects
   -h, --help                 Show this help
 ```
 
@@ -812,10 +904,12 @@ CHANGES
     --no-keep      destroy them when the command exits
     --keep=<dir>   keep them in <dir> instead of a /tmp stash
     --yes          apply them to the real directory as the command exits
+    --report=<f>   also write the change list to f, to replay later
   Either way the prompt accepts d for a diff of exactly those changes.
 
 COMMANDS
   apply <stash>              Replay a saved stash onto the host
+  apply --from=<report>      Replay only what a report selects
   stash list                 List stashes left in /tmp
 
 OPTIONS
@@ -836,6 +930,7 @@ EXAMPLES
   $ poof bun install              # kept; replay with poof apply
   $ poof --yes make               # applied as soon as it exits
   $ poof --no-keep rm -rf ~       # Safe! Nothing happens
+  $ poof apply --dry-run /tmp/poof-3f9a2b   # look, change nothing
   $ poof                          # a shell, reviewed on exit
 
 NOTE  Works inside Docker/Podman (1 nesting level, kernel limit)

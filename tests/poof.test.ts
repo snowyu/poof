@@ -139,9 +139,10 @@ describe("poof CLI", () => {
       expect(output).toContain("--keep");
       expect(output).toContain("--no-keep");
       // The old mode words are gone, not merely hidden: help must not mention
-      // them, or readers take them as still available.
-      for (const word of ["exec", "run ", "enter"]) {
-        expect(output).not.toContain(word);
+      // them, or readers take them as still available. They are matched as whole
+      // words, so a flag that ends in one of them (--dry-run) is not mistaken for it.
+      for (const word of ["exec", "run", "enter"]) {
+        expect(output).not.toMatch(new RegExp(`(^|\\s)${word}(\\s|$)`));
       }
       // Help is the requested result: it must be pipeable, not on stderr.
       expect(result.stderr.toString()).toBe("");
@@ -1692,6 +1693,296 @@ describe("poof CLI", () => {
       expect(r.exitCode).toBe(0);
       expect(r.stdout.toString()).toContain("poof apply");
       expect(r.stdout.toString()).toContain("--yes");
+      expect(r.stdout.toString()).toContain("--dry-run");
+      expect(r.stdout.toString()).toContain("--report=<file>");
+      expect(r.stdout.toString()).toContain("--from=<report>");
+    });
+
+    // --- --dry-run: the change list, without the writes ---------------------
+
+    test("--dry-run prints the changes and writes nothing", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "dry.txt"), "dry\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--dry-run"]);
+      const out = r.stdout.toString() + r.stderr.toString();
+      expect(r.exitCode).toBe(0);
+      expect(out).toContain(targetDir.slice(1) + "/dry.txt");
+      expect(out).toContain("nothing applied");
+      expect(existsSync(join(targetDir, "dry.txt"))).toBe(false);
+      // A dry run has applied nothing, so there is no reason to touch the stash.
+      expect(existsSync(stashDir)).toBe(true);
+    });
+
+    test("--dry-run needs no terminal, and --yes cannot make it write", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "dry.txt"), "dry\n");
+
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--dry-run", "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(join(targetDir, "dry.txt"))).toBe(false);
+    });
+
+    // --- --report=<file>: the apply written down, and read back -------------
+
+    // Paths inside the stash are relative to the target root, which is what a
+    // report's patterns are matched against.
+    const inside = (rel: string) => `${targetDir.slice(1)}/${rel}`;
+
+    test("--report=<file> records what the apply put on the target", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(join(mirrored, "src"), { recursive: true });
+      writeFileSync(join(mirrored, "src", "a.c"), "a\n");
+      writeFileSync(join(mirrored, ".wh.gone.txt"), "");
+      writeFileSync(join(targetDir, "gone.txt"), "x\n");
+
+      const plan = join(TEST_DIR, "applied.report");
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--yes", `--report=${plan}`]);
+      expect(r.exitCode).toBe(0);
+
+      const text = readFileSync(plan, "utf8");
+      expect(text).toContain(`@stash ${stashDir}`);
+      expect(text).toContain("@target /");
+      expect(text).toContain("@mode applied");
+      expect(text).toContain(`+ ${inside("src/a.c")}`);
+      expect(text).toContain(`- ${inside("gone.txt")}`);
+    });
+
+    test("--dry-run --report=<file> records the plan without applying it", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "planned.txt"), "x\n");
+
+      const plan = join(TEST_DIR, "planned.report");
+      const r = spawnSync([POOF_BIN, "apply", stashDir, "--dry-run", `--report=${plan}`]);
+      expect(r.exitCode).toBe(0);
+
+      const text = readFileSync(plan, "utf8");
+      expect(text).toContain("@mode dry-run");
+      expect(text).toContain(`+ ${inside("planned.txt")}`);
+      expect(existsSync(join(targetDir, "planned.txt"))).toBe(false);
+    });
+
+    test("--from=<report> replays the stash its @stash line names", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "replayed.txt"), "replayed\n");
+
+      const plan = join(TEST_DIR, "replay.report");
+      expect(spawnSync([POOF_BIN, "apply", stashDir, "--dry-run", `--report=${plan}`]).exitCode).toBe(0);
+
+      // No stash on the command line: the report says where its changes live.
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(join(targetDir, "replayed.txt"), "utf8")).toBe("replayed\n");
+    });
+
+    test("a positional stash overrides the report's @stash", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "chosen.txt"), "chosen\n");
+
+      const other = mkdtempSync(join(TEST_DIR, "other-stash-"));
+      try {
+        const plan = join(TEST_DIR, "override.report");
+        writeFileSync(plan, `@stash ${other}\n+ ${inside("chosen.txt")}\n`);
+
+        const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, stashDir, "--yes"]);
+        expect(r.exitCode).toBe(0);
+        expect(r.stderr.toString()).toContain(stashDir);
+        expect(readFileSync(join(targetDir, "chosen.txt"), "utf8")).toBe("chosen\n");
+      } finally {
+        rmSync(other, { recursive: true, force: true });
+      }
+    });
+
+    test("a hand-written report applies only what its patterns select", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(join(mirrored, "src"), { recursive: true });
+      writeFileSync(join(mirrored, "src", "a.c"), "a\n");
+      writeFileSync(join(mirrored, "src", "b.c"), "b\n");
+      writeFileSync(join(mirrored, "src", "notes.md"), "n\n");
+
+      const plan = join(TEST_DIR, "subset.report");
+      writeFileSync(plan, `@stash ${stashDir}\n${inside("src/*.c")}\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      const out = r.stdout.toString() + r.stderr.toString();
+      expect(r.exitCode).toBe(0);
+      expect(out).toContain("report selects 2 of 3 change(s)");
+
+      expect(existsSync(join(targetDir, "src", "a.c"))).toBe(true);
+      expect(existsSync(join(targetDir, "src", "b.c"))).toBe(true);
+      expect(existsSync(join(targetDir, "src", "notes.md"))).toBe(false);
+
+      // The change the report left out is still the user's to replay or throw
+      // away, so the stash that holds it is kept rather than deleted with it.
+      expect(out).toContain("not selected");
+      expect(existsSync(stashDir)).toBe(true);
+    });
+
+    // A filtered apply replays the selected entries and nothing else around them:
+    // the directory holding an excluded file must not arrive on the target empty.
+    test("a report that excludes a directory leaves the target without it", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(join(mirrored, "src"), { recursive: true });
+      mkdirSync(join(mirrored, "vendor", "nested"), { recursive: true });
+      writeFileSync(join(mirrored, "src", "a.c"), "a\n");
+      writeFileSync(join(mirrored, "vendor", "nested", "b.o"), "b\n");
+
+      const plan = join(TEST_DIR, "no-vendor.report");
+      writeFileSync(plan, `@stash ${stashDir}\n${inside("src/*.c")}\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(join(targetDir, "src", "a.c"), "utf8")).toBe("a\n");
+      expect(existsSync(join(targetDir, "vendor"))).toBe(false);
+      expect(readdirSync(targetDir)).toEqual(["src"]);
+    });
+
+    test("a report of only exclusions keeps the rest of the changes", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "keep.txt"), "keep\n");
+      writeFileSync(join(mirrored, "skip.txt"), "skip\n");
+
+      const plan = join(TEST_DIR, "exclude.report");
+      writeFileSync(plan, `@stash ${stashDir}\n! ${inside("skip.txt")}\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(join(targetDir, "keep.txt"))).toBe(true);
+      expect(existsSync(join(targetDir, "skip.txt"))).toBe(false);
+    });
+
+    test("**/ in a report pattern spans directories", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(join(mirrored, "deep", "nest"), { recursive: true });
+      writeFileSync(join(mirrored, "deep", "nest", "c.h"), "h\n");
+      writeFileSync(join(mirrored, "deep", "nest", "c.o"), "o\n");
+
+      const plan = join(TEST_DIR, "deep.report");
+      writeFileSync(plan, `@stash ${stashDir}\n${inside("deep/**/*.h")}\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(existsSync(join(targetDir, "deep", "nest", "c.h"))).toBe(true);
+      expect(existsSync(join(targetDir, "deep", "nest", "c.o"))).toBe(false);
+    });
+
+    // A replaced directory arrives from the overlay marked opaque, and a plain
+    // apply clears the target's copy of it before replaying. Where a report
+    // leaves some of that directory's changes out, poof must not clear it: it was
+    // never asked to delete what the report left behind.
+    test("a report that picks files out of a replaced directory leaves the rest of it", () => {
+      const mirrored = mirror(join(targetDir, "src"));
+      mkdirSync(mirrored, { recursive: true });
+      mkdirSync(join(targetDir, "src"), { recursive: true });
+      writeFileSync(join(mirrored, ".wh..wh..opq"), "");
+      writeFileSync(join(mirrored, "one.c"), "one\n");
+      writeFileSync(join(mirrored, "two.c"), "two\n");
+      writeFileSync(join(targetDir, "src", "stale.c"), "stale\n");
+
+      const plan = join(TEST_DIR, "pick-one.report");
+      writeFileSync(plan, `@stash ${stashDir}\n${inside("src/one.c")}\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(join(targetDir, "src", "one.c"), "utf8")).toBe("one\n");
+      expect(existsSync(join(targetDir, "src", "two.c"))).toBe(false);
+      expect(readFileSync(join(targetDir, "src", "stale.c"), "utf8")).toBe("stale\n");
+    });
+
+    test("a report that leaves nothing out replaces an opaque directory like a plain apply", () => {
+      const mirrored = mirror(join(targetDir, "src"));
+      mkdirSync(mirrored, { recursive: true });
+      mkdirSync(join(targetDir, "src"), { recursive: true });
+      writeFileSync(join(mirrored, ".wh..wh..opq"), "");
+      writeFileSync(join(mirrored, "fresh.c"), "fresh\n");
+      writeFileSync(join(targetDir, "src", "stale.c"), "stale\n");
+
+      const plan = join(TEST_DIR, "pick-all.report");
+      writeFileSync(plan, `@stash ${stashDir}\n${inside("src/**")}\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(join(targetDir, "src", "fresh.c"), "utf8")).toBe("fresh\n");
+      expect(existsSync(join(targetDir, "src", "stale.c"))).toBe(false);
+    });
+
+    test("a report that selects nothing applies nothing", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "only.txt"), "x\n");
+
+      const plan = join(TEST_DIR, "empty.report");
+      writeFileSync(plan, `@stash ${stashDir}\n${inside("nothing/*.c")}\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      const out = r.stdout.toString() + r.stderr.toString();
+      expect(r.exitCode).toBe(0);
+      expect(out).toContain("is selected by");
+      expect(existsSync(join(targetDir, "only.txt"))).toBe(false);
+      expect(existsSync(stashDir)).toBe(true);
+    });
+
+    test("--from on a report without @stash says the stash is missing", () => {
+      const plan = join(TEST_DIR, "no-stash.report");
+      writeFileSync(plan, "+ some/file.txt\n");
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("has no @stash line");
+    });
+
+    test("--from on a report whose stash is gone says so", () => {
+      const gone = join(TEST_DIR, "already-applied-stash");
+      const plan = join(TEST_DIR, "stale.report");
+      writeFileSync(plan, `@stash ${gone}\n@mode applied\n`);
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("names a stash that is gone");
+    });
+
+    test("--dry-run and --from belong to poof apply", () => {
+      const r = spawnSync([POOF_BIN, "--dry-run", "true"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("belong to poof apply");
+
+      // --from does not turn a run into an apply the way --apply= does: alone it
+      // would leave the command after it (here `true`) with no meaning at all.
+      const bare = spawnSync([POOF_BIN, `--from=${join(TEST_DIR, "whatever.report")}`, "true"]);
+      expect(bare.exitCode).toBe(1);
+      expect(bare.stderr.toString()).toContain("belong to poof apply");
+    });
+
+    // The script-friendly spelling of the same thing: --apply= is what makes the
+    // command an apply, --from= then filters it.
+    test("poof --apply=<stash> --from=<report> filters the replay", () => {
+      const mirrored = mirror(targetDir);
+      mkdirSync(mirrored, { recursive: true });
+      writeFileSync(join(mirrored, "want.txt"), "want\n");
+      writeFileSync(join(mirrored, "not.txt"), "not\n");
+
+      const plan = join(TEST_DIR, "apply-filter.report");
+      writeFileSync(plan, `${inside("want.txt")}\n`);
+
+      const r = spawnSync([POOF_BIN, `--apply=${stashDir}`, `--from=${plan}`, "--yes"]);
+      const out = r.stdout.toString() + r.stderr.toString();
+      expect(r.exitCode).toBe(0);
+      expect(out).toContain("report selects 1 of 2 change(s)");
+      expect(existsSync(join(targetDir, "want.txt"))).toBe(true);
+      expect(existsSync(join(targetDir, "not.txt"))).toBe(false);
+    });
+
+    test("--report conflicts with --no-keep, which destroys what it would point at", () => {
+      const r = spawnSync([POOF_BIN, "--no-keep", `--report=${join(TEST_DIR, "never.report")}`, "true"]);
+      expect(r.exitCode).toBe(1);
+      expect(r.stderr.toString()).toContain("--report and --no-keep conflict");
+      expect(existsSync(join(TEST_DIR, "never.report"))).toBe(false);
     });
 
     test("stash list finds a stash by its poof-<hex> name", () => {
@@ -1737,6 +2028,35 @@ describe("poof CLI", () => {
       expect(r.exitCode).toBe(0);
       expect(existsSync(victim)).toBe(false);
       expect(existsSync(stash!)).toBe(false); // applied in full: the stash is cleaned up
+
+      cleanupStash(session.output);
+      rmSync(dir, { recursive: true, force: true });
+    }, 30_000);
+
+    // The session side of the same loop: --report=<file> writes the change list
+    // when the session ends, and the file it wrote is a plan poof can replay.
+    test("a session's report can be replayed with poof apply --from", async () => {
+      const dir = mkdtempSync(join(TEST_DIR, "report-e2e-"));
+      const made = join(dir, "made.txt");
+      const plan = join(TEST_DIR, "session.report");
+
+      const session = new TerminalSession(dir, undefined, [`--report=${plan}`, "sh", "-c", `echo made > ${made}`]);
+      await session.waitForNew("[y/N/d(iff)]");
+      session.write("n\n"); // kept, not applied: the report is the plan
+      await session.waitFor("Stashed changes in");
+      await session.waitForExit();
+
+      expect(existsSync(made)).toBe(false);
+      const text = readFileSync(plan, "utf8");
+      expect(text).toContain("@mode kept");
+      // A session prints its changes relative to where it worked, and records that
+      // as @target; --from reads the line back against it.
+      expect(text).toContain(`@target ${dir}`);
+      expect(text).toContain("+ made.txt");
+
+      const r = spawnSync([POOF_BIN, "apply", `--from=${plan}`, "--yes"]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(made, "utf8")).toBe("made\n");
 
       cleanupStash(session.output);
       rmSync(dir, { recursive: true, force: true });

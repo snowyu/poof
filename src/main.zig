@@ -8,6 +8,7 @@ const options = @import("build_options");
 const output = @import("output.zig");
 const sandbox = @import("sandbox.zig");
 const diffview = @import("diffview.zig");
+const report = @import("report.zig");
 
 // Version info (set at build time)
 const version = options.version;
@@ -434,17 +435,34 @@ fn handleExitApply(config: Config) void {
 
     if (config.apply_at_exit == .always) {
         // --yes: the list above is the notice, there is no question to ask.
-        applyChanges(changes_path, target_dir);
+        const stats = applyChanges(changes_path, target_dir, null);
+        reportExit(config, upper_dir, target_dir, changes.items[0..changes.len], stats.failed == 0);
         return;
     }
 
     const question = std.fmt.allocPrint(allocator, "Apply these changes to {s}?", .{target_dir}) catch
         "Apply these changes?";
     if (askApply(question, changes.items[0..changes.len], changes_path, target_dir)) {
-        applyChanges(changes_path, target_dir);
+        const stats = applyChanges(changes_path, target_dir, null);
+        reportExit(config, upper_dir, target_dir, changes.items[0..changes.len], stats.failed == 0);
     } else {
         keepChanges(upper_dir);
+        // Not applied: the report is the plan, and @stash points at the upper dir
+        // `poof apply` can replay it from.
+        if (config.report_path) |path| _ = writeReport(path, upper_dir, target_dir, "kept", changes.items[0..changes.len]);
     }
+}
+
+// --report=<file> on a session: the change list this session produced, written
+// down once what happened to it is decided. Only a finished apply is recorded as
+// one; a partial failure leaves the stash, and the report would claim otherwise.
+fn reportExit(config: Config, upper_dir: []const u8, target_dir: []const u8, changes: []const Change, applied: bool) void {
+    const path = config.report_path orelse return;
+    if (!applied) {
+        warn("not all changes applied; no report written (stash kept in {s})", .{upper_dir});
+        return;
+    }
+    _ = writeReport(path, upper_dir, target_dir, "applied", changes);
 }
 
 // Ask what to do with a change list; `d` shows a unified diff and asks again.
@@ -605,13 +623,60 @@ fn copyFile(src_z: [*:0]const u8, dst_z: [*:0]const u8, mode: u32, stats: *Apply
 // directories are created and recursed, symlinks are recreated as symlinks and
 // regular files are copied with their mode. `cp -r` cannot do any of the first
 // two, which is why this is hand rolled.
-fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats) void {
+// The paths one apply replayed, in the form the change list prints them. A
+// report filter turns its globs into this set once (`report.matches`), and the
+// walk below then replays exactly those paths.
+const Selected = std.StringHashMap(void);
+
+fn isSelected(sel: ?*const Selected, key: []const u8) bool {
+    const set = sel orelse return true;
+    return set.contains(key);
+}
+
+/// True when a report filter names this directory itself or anything beneath it.
+/// An unfiltered walk reaches everywhere.
+fn selectionReaches(sel: ?*const Selected, key: []const u8) bool {
+    const set = sel orelse return true;
+    if (set.contains(key)) return true;
+    // `key` is "" only for the walk's own root, which is always reached.
+    const prefix = std.fmt.allocPrint(allocator, "{s}/", .{key}) catch return true;
+    defer allocator.free(prefix);
+    var it = set.keyIterator();
+    while (it.next()) |k| {
+        if (std.mem.startsWith(u8, k.*, prefix)) return true;
+    }
+    return false;
+}
+
+/// The key an entry is matched on: its target path with the walk's root removed,
+/// with no leading slash - the same form the report line it came from is written
+/// in, so what poof printed is what selects it.
+fn matchKey(walk_root: []const u8, dst_path: []const u8) []const u8 {
+    const rel = if (std.mem.startsWith(u8, dst_path, walk_root)) dst_path[walk_root.len..] else dst_path;
+    return report.matchPath(rel);
+}
+
+// Walk the upper dir and replay it onto the target: whiteouts become deletions,
+// directories are created and recursed, symlinks are recreated as symlinks and
+// regular files are copied with their mode. `cp -r` cannot do any of the first
+// two, which is why this is hand rolled.
+//
+// `sel`, when given, comes from a report: the walk still descends everywhere (a
+// filter says which changes to replay, not which directories to look in), but an
+// entry is only replayed when its path is in the set.
+fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats, sel: ?*const Selected, walk_root: []const u8) void {
     var dir = sandbox.DirStream.open(src_dir) orelse {
         err("cannot read changes in {s}", .{src_dir});
         stats.failed += 1;
         return;
     };
     defer dir.close();
+
+    // A directory is descended into and created only when the report reaches it:
+    // an empty one is a change of its own, and one whose contents the report left
+    // out must stay off the target rather than appear there blank.
+    const is_root = std.mem.eql(u8, dst_dir, walk_root);
+    if (!is_root and !selectionReaches(sel, matchKey(walk_root, dst_dir))) return;
 
     if (!sandbox.pathExists(dst_dir)) {
         sandbox.makeDirs(dst_dir) catch |e| {
@@ -622,8 +687,12 @@ fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats) void 
     }
 
     // Never let an opaque marker wipe the filesystem root: that would be the
-    // upper dir's own marker, not a user replacing a directory.
-    if (hasOpaqueMarker(src_dir) and !std.mem.eql(u8, dst_dir, "/")) clearDir(dst_dir, stats);
+    // upper dir's own marker, not a user replacing a directory. A filtered apply
+    // clears it only when the report names that directory itself: picking a few
+    // files out of a replaced directory must not delete the rest of the target.
+    if (hasOpaqueMarker(src_dir) and !std.mem.eql(u8, dst_dir, "/")) {
+        if (isSelected(sel, matchKey(walk_root, dst_dir))) clearDir(dst_dir, stats);
+    }
 
     while (dir.next()) |entry| {
         // Overlay bookkeeping, never user data.
@@ -641,15 +710,18 @@ fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats) void 
         const dst_z = zPath(dst_path) orelse continue;
 
         if (isWhiteout(entry.name, entry.kind, fi)) {
+            if (!isSelected(sel, matchKey(walk_root, dst_path))) continue;
             removeTarget(dst_path);
             stats.applied += 1;
             continue;
         }
 
         if (entry.kind == .directory) {
-            applyTree(src_path, dst_path, stats);
+            applyTree(src_path, dst_path, stats, sel, walk_root);
             continue;
         }
+
+        if (!isSelected(sel, matchKey(walk_root, dst_path))) continue;
 
         if (fi != null and fi.?.is_link) {
             var link_buf: [4096]u8 = undefined;
@@ -680,17 +752,43 @@ fn applyTree(src_dir: []const u8, dst_dir: []const u8, stats: *ApplyStats) void 
     }
 }
 
-fn applyChanges(source: []const u8, target: []const u8) void {
+fn applyChanges(source: []const u8, target: []const u8, sel: ?*const Selected) ApplyStats {
     step("Applying changes to {s}", .{target});
 
     var stats = ApplyStats{};
-    applyTree(source, target, &stats);
+    applyTree(source, target, &stats, sel, target);
 
     if (stats.failed == 0) {
         success("Changes applied successfully ({d})", .{stats.applied});
     } else {
         err("applied {d} change(s), {d} failed", .{ stats.applied, stats.failed });
     }
+    return stats;
+}
+
+// Write the report of what an apply put (or would put) onto the target. The file
+// is the interaction written down: its @stash line says where the changes came
+// from, its lines are globs over what poof printed, and editing it turns it into
+// a plan for `poof apply --from=<file>`.
+fn writeReport(path: []const u8, stash: []const u8, target: []const u8, mode: []const u8, changes: []const Change) bool {
+    const text = report.format(allocator, .{
+        .stash = stash,
+        .target = target,
+        .mode = mode,
+        .at = clockSecs(posix.CLOCK.REALTIME),
+        .changes = changes,
+    }) catch |e| {
+        err("cannot write report {s}: {}", .{ path, e });
+        return false;
+    };
+    defer allocator.free(text);
+
+    report.save(path, text) catch |e| {
+        err("cannot write report {s}: {}", .{ path, e });
+        return false;
+    };
+    success("Report: {d} change(s) {s}, written to {s}", .{ changes.len, mode, path });
+    return true;
 }
 
 // ============================================================================
@@ -751,8 +849,53 @@ fn collectStashChanges(stash: []const u8, changes: *ChangeList) void {
     collectChanges(stash, "/", stash, changes);
 }
 
-fn applyStash(input: []const u8, cwd: []const u8, assume_yes: bool) u8 {
-    const stash = resolveStash(input, cwd) orelse return 1;
+// How one `poof apply` was asked to behave.
+const ApplyOptions = struct {
+    /// Show what would be applied and stop: nothing is written, the stash is kept.
+    dry_run: bool = false,
+    /// Write the list of changes to this file, as a report `--from` reads back.
+    report_path: ?[]const u8 = null,
+    /// Replay only the changes this report selects.
+    from_path: ?[]const u8 = null,
+};
+
+fn applyStash(input: ?[]const u8, cwd: []const u8, assume_yes: bool, opts: ApplyOptions) u8 {
+    // A report knows where its own changes came from: poof wrote the stash path
+    // into its @stash line when it recorded them. A stash named on the command
+    // line still wins, which is how one report gets replayed against another
+    // copy of the same changes.
+    var rpt: ?report.Report = null;
+    defer if (rpt) |*r| r.deinit(allocator);
+    if (opts.from_path) |from| {
+        rpt = report.load(allocator, from) catch |e| {
+            err("cannot read report {s}: {}", .{ from, e });
+            return 1;
+        };
+    }
+
+    const stash_input = input orelse if (rpt) |r| (r.stash orelse null) else null;
+    if (stash_input == null) {
+        if (opts.from_path != null) {
+            err("{s} has no @stash line: name the stash to apply, poof apply --from=<report> <stash>", .{opts.from_path.?});
+        } else {
+            err("apply needs a stash directory: poof apply <stash>", .{});
+        }
+        return 1;
+    }
+
+    // A full apply removes the stash it applied, so replaying a report after one
+    // is the common way to end up here; say which of the two it is.
+    const stash_abs = if (stash_input.?.len > 0 and stash_input.?[0] == '/')
+        normalizePath(allocator, stash_input.?) orelse return 1
+    else
+        std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, stash_input.? }) catch return 1;
+    if (opts.from_path != null and !sandbox.pathExists(stash_abs)) {
+        err("{s} names a stash that is gone: {s}", .{ opts.from_path.?, stash_abs });
+        info("a full apply removes the stash it applied; a report written with --dry-run does not", .{});
+        return 1;
+    }
+
+    const stash = resolveStash(stash_input.?, cwd) orelse return 1;
 
     var change_buf: [1000]Change = undefined;
     var changes = ChangeList{ .items = &change_buf, .len = 0 };
@@ -763,9 +906,55 @@ fn applyStash(input: []const u8, cwd: []const u8, assume_yes: bool) u8 {
         return 0;
     }
 
+    // The report filter: its globs are resolved against the change list once, and
+    // the apply walks the stash replaying exactly the paths that survived.
+    var selected = Selected.init(allocator);
+    defer selected.deinit();
+    var sel: ?*const Selected = null;
+    // Whether the report left anything out, which decides if the stash still has
+    // a use once the apply is done.
+    var filtered = false;
+    var total_changes: usize = changes.len;
+    if (rpt) |r| {
+        const total = changes.len;
+        total_changes = total;
+        const base = if (r.target) |t| t else "/";
+        var kept: usize = 0;
+        for (change_buf[0..total]) |change| {
+            if (!report.matches(r, change, base)) continue;
+            selected.put(report.matchPath(change.path), {}) catch {
+                err("out of memory reading {s}", .{opts.from_path.?});
+                return 1;
+            };
+            change_buf[kept] = change;
+            kept += 1;
+        }
+        changes.len = kept;
+        if (kept < total) {
+            // Only a report that left something out filters the walk. When every
+            // change survived, the set is the whole change list, so replaying it
+            // unfiltered is the same work - and it is what lets a replaced
+            // (opaque) directory be cleared here exactly as a plain apply clears
+            // it, rather than quietly keeping the target's stale contents.
+            sel = &selected;
+            filtered = true;
+            info("report selects {d} of {d} change(s)", .{ kept, total });
+        }
+        if (kept == 0) {
+            info("nothing in {s} is selected by {s}", .{ stash, opts.from_path.? });
+            return 0;
+        }
+    }
+
     // The preview is the safety mechanism: applying writes straight to /.
     printChanges(changes.items[0..changes.len], stash);
     print("\n", .{});
+
+    if (opts.dry_run) {
+        if (opts.report_path) |path| _ = writeReport(path, stash, "/", "dry-run", changes.items[0..changes.len]);
+        info("dry run: nothing applied; stash kept in {s}", .{stash});
+        return 0;
+    }
 
     if (!assume_yes) {
         if (std.c.isatty(std.posix.STDIN_FILENO) != 1) {
@@ -782,12 +971,25 @@ fn applyStash(input: []const u8, cwd: []const u8, assume_yes: bool) u8 {
     }
 
     var stats = ApplyStats{};
-    applyTree(stash, "/", &stats);
+    applyTree(stash, "/", &stats, sel, "/");
 
     if (stats.failed != 0) {
         err("applied {d} change(s), {d} failed", .{ stats.applied, stats.failed });
         info("stash kept in {s}; fix what failed and apply it again", .{stash});
         return 1;
+    }
+
+    // The report describes a finished apply, so it is written once the whole list
+    // is on the target - the same rule that decides whether the stash is removed.
+    if (opts.report_path) |path| _ = writeReport(path, stash, "/", "applied", changes.items[0..changes.len]);
+
+    // A report that left changes out leaves the stash holding them: what it
+    // excluded is still the user's to replay or throw away, and deleting it here
+    // would be a deletion poof was never asked to make.
+    if (filtered) {
+        const left = if (total_changes > stats.applied) total_changes - stats.applied else 0;
+        success("Applied {d} change(s); {s} kept, {d} of its change(s) not selected", .{ stats.applied, stash, left });
+        return 0;
     }
 
     // Fully applied: the upper dir has served its purpose and would otherwise
@@ -1088,11 +1290,14 @@ fn printApplyHelp() void {
     print("\n{s}USAGE{s}\n", .{ B, R });
     print("  {s}poof apply{s} [options] <stash>\n", .{ C, R });
     print("  {s}poof --apply=<stash>{s}        the same, script-friendly\n", .{ C, R });
+    print("  {s}poof apply --from=<report>{s}  replay what a report selects\n", .{ C, R });
 
     print("\n{s}EXAMPLES{s}\n", .{ B, R });
     print("  $ poof stash list                  {s}# find stashes{s}\n", .{ D, R });
     print("  $ poof apply /tmp/poof-3f9a2b      {s}# preview, then confirm{s}\n", .{ D, R });
-    print("  $ poof apply /tmp/poof-3f9a2b --yes\n", .{});
+    print("  $ poof apply /tmp/poof-3f9a2b --yes --report=done.txt\n", .{});
+    print("  $ poof apply /tmp/poof-3f9a2b --dry-run --report=plan.txt\n", .{});
+    print("  $ poof apply --from=plan.txt       {s}# plan.txt says which stash{s}\n", .{ D, R });
 
     print("\n{s}NOTES{s}\n", .{ B, R });
     print("  A stash mirrors absolute paths, so <stash>/home/me/proj/x.c applies\n", .{});
@@ -1102,8 +1307,22 @@ fn printApplyHelp() void {
     print("  first and confirmation is required unless --yes is given. A stash that\n", .{});
     print("  applies in full is removed; a partial failure keeps it for a retry.\n", .{});
 
+    print("\n{s}REPORTS{s}\n", .{ B, R });
+    print("  --report=<file> writes the changes this apply dealt with: a header\n", .{});
+    print("  naming the stash (@stash) and target (@target), then one line per\n", .{});
+    print("  change - + added, ~ edited, - deleted. It is text meant to be edited:\n", .{});
+    print("  widen a path into a glob (src/**/*.c), delete the lines you do not\n", .{});
+    print("  want, add `! src/vendor/**` to keep something out - then apply the\n", .{});
+    print("  result with `poof apply --from=<file>`. Patterns are shell globs over\n", .{});
+    print("  the paths above, so * stops at / and **/ spans directories. A report\n", .{});
+    print("  with only ! lines starts from everything and subtracts; a filtered\n", .{});
+    print("  apply keeps the stash, so what it left out is still there.\n", .{});
+
     print("\n{s}OPTIONS{s}\n", .{ B, R });
     print("  {s}--yes{s}                      Apply without prompting\n", .{ C, R });
+    print("  {s}--dry-run{s}                  Show the changes, write nothing\n", .{ C, R });
+    print("  {s}--report=<file>{s}            Record the changes as a report\n", .{ C, R });
+    print("  {s}--from=<report>{s}            Apply only what a report selects\n", .{ C, R });
     print("  {s}-h, --help{s}                 Show this help\n", .{ C, R });
 }
 
@@ -1141,18 +1360,20 @@ fn printUsage() void {
         \\    {s}--no-keep{s}      destroy them when the command exits
         \\    {s}--keep=<dir>{s}   keep them in <dir> instead of a /tmp stash
         \\    {s}--yes{s}          apply them to the real directory as the command exits
+        \\    {s}--report=<f>{s}   also write the change list to f, to replay later
         \\  Either way the prompt accepts {s}d{s} for a diff of exactly those changes.
         \\
-    , .{ B, R, C, R, Y, R, C, R, G, R, C, R, D, R, B, R, C, R, D, R, C, R, C, R, C, R });
+    , .{ B, R, C, R, Y, R, C, R, G, R, C, R, D, R, B, R, C, R, D, R, C, R, C, R, C, R, C, R });
 
     // Subcommands
     print(
         \\
         \\{s}COMMANDS{s}
         \\  {s}apply{s} <stash>              Replay a saved stash onto the host
+        \\  {s}apply{s} --from=<report>      Replay only what a report selects
         \\  {s}stash{s} list                 List stashes left in /tmp
         \\
-    , .{ B, R, C, R, C, R });
+    , .{ B, R, C, R, C, R, C, R });
 
     // Options
     print(
@@ -1182,9 +1403,10 @@ fn printUsage() void {
         \\  {s}${s} poof bun install              {s}# kept; replay with poof apply{s}
         \\  {s}${s} poof --yes make               {s}# applied as soon as it exits{s}
         \\  {s}${s} poof --no-keep rm -rf ~       {s}# Safe! Nothing happens{s}
+        \\  {s}${s} poof apply --dry-run /tmp/poof-3f9a2b   {s}# look, change nothing{s}
         \\  {s}${s} poof                          {s}# a shell, reviewed on exit{s}
         \\
-    , .{ B, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R });
+    , .{ B, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R });
 
     print(
         \\{s}NOTE{s}  Works inside Docker/Podman {s}(1 nesting level, kernel limit){s}
@@ -1215,6 +1437,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var sub: ?Subcommand = null;
     var apply_opt: ?[]const u8 = null;
     var assume_yes = false;
+    // `poof apply` extras, and --report for a session too.
+    var dry_run = false;
+    var report_path: ?[]const u8 = null;
+    var from_path: ?[]const u8 = null;
     var cmd_start: usize = args.len;
     var sub_arg: ?[]const u8 = null;
 
@@ -1245,6 +1471,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
             apply_opt = arg[8..];
             sub = .apply;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else if (std.mem.startsWith(u8, arg, "--report=")) {
+            if (arg[9..].len == 0) {
+                err("invalid report: (use --report=<file>)", .{});
+                return 1;
+            }
+            report_path = arg[9..];
+        } else if (std.mem.startsWith(u8, arg, "--from=")) {
+            if (arg[7..].len == 0) {
+                err("invalid from: (use --from=<report file>)", .{});
+                return 1;
+            }
+            // Deliberately not `sub = .apply` the way --apply= is: on its own a
+            // report says nothing about which stash to replay *this* command's
+            // changes from, and silently becoming an apply would swallow the
+            // command that follows it.
+            from_path = arg[7..];
         } else if (std.mem.eql(u8, arg, "--yes")) {
             assume_yes = true;
         } else if (std.mem.startsWith(u8, arg, "--timeout=")) {
@@ -1315,7 +1559,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         switch (s) {
             .apply => {
                 const target = apply_opt orelse sub_arg;
-                if (target == null) {
+                // --from alone is enough: the report carries the stash it was
+                // written from.
+                if (target == null and from_path == null) {
                     err("apply needs a stash directory: poof apply <stash>", .{});
                     return 1;
                 }
@@ -1323,7 +1569,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                     err("apply takes no command: {s}", .{sub_arg.?});
                     return 1;
                 }
-                return applyStash(target.?, cwd, assume_yes);
+                return applyStash(target, cwd, assume_yes, .{
+                    .dry_run = dry_run,
+                    .report_path = report_path,
+                    .from_path = from_path,
+                });
             },
             .stash => {
                 const what = sub_arg orelse "list";
@@ -1333,6 +1583,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             },
         }
     }
+
+    // The apply extras have no meaning for a session: nothing has been applied
+    // yet, and there is no report to replay.
+    if (dry_run or from_path != null) {
+        err("--dry-run and --from belong to poof apply", .{});
+        return 1;
+    }
+    // A report points at a stash by name; --no-keep destroys it, so the file
+    // would describe changes that cannot be replayed.
+    if (report_path != null and no_keep) {
+        err("--report and --no-keep conflict: --no-keep destroys the changes the report would point at", .{});
+        return 1;
+    }
+    config.report_path = report_path;
 
     // Axis one: what happens to the changes once the session ends.
     if (no_keep and keep_dir != null) {
