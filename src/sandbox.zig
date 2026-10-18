@@ -1299,8 +1299,25 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
     forward_to_pid = 0;
     installSignalForwarding();
 
+    // Hold the forwarded signals blocked across the fork and the forward_to_pid
+    // assignment below. A TERM landing in that window would reach forwardSignal while
+    // forward_to_pid is still 0, be dropped, and leave this process waiting for a
+    // command nothing will ever signal - and poof's signal handler waiting on this
+    // process forever. Blocked, the signal stays pending until there is something to
+    // forward it to.
+    var fwd_block = linux.sigemptyset();
+    linux.sigaddset(&fwd_block, linux.SIG.INT);
+    linux.sigaddset(&fwd_block, linux.SIG.TERM);
+    linux.sigaddset(&fwd_block, linux.SIG.HUP);
+    linux.sigaddset(&fwd_block, linux.SIG.QUIT);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &fwd_block, null);
+
     const cmd_pid = forkChild();
     if (cmd_pid.pid == 0) {
+        // The mask survives fork and exec, and the command must be interruptible.
+        var clear = linux.sigemptyset();
+        _ = linux.sigprocmask(linux.SIG.SETMASK, &clear, null);
+
         // execvp resolves argv[0] via PATH and inherits the current environ
         // (which already has IS_SANDBOX=1 set above).
         _ = execvp(argv[0].?, argv.ptr);
@@ -1328,6 +1345,11 @@ pub fn childMain(config: Config, orig_uid: u32, orig_gid: u32) noreturn {
         std.process.exit(1);
     }
     forward_to_pid = cmd_pid.pid;
+
+    // Unblock: anything that arrived during the window is delivered now, and
+    // forwardSignal has a command to pass it to.
+    var unblock = linux.sigemptyset();
+    _ = linux.sigprocmask(linux.SIG.SETMASK, &unblock, null);
 
     var status: i32 = 0;
     while (true) {

@@ -83,12 +83,29 @@ var interactive_upper: ?[]const u8 = null;
 var interactive_changes_path: ?[]const u8 = null;
 
 fn signalHandler(sig: linux.SIG) callconv(.c) void {
-    // Forward signal to child and wait for it to exit
+    // Forward signal to child and wait for it to exit, so the mounts are torn down
+    // before poof leaves. The wait is bounded: a sandbox that never acts on the
+    // signal must not leave poof blocked here holding the terminal open.
     if (child_pid > 0) {
         _ = linux.kill(child_pid, sig);
-        // Wait for child to exit so mounts are cleaned up
         var status: i32 = 0;
-        _ = linux.waitpid(child_pid, &status, 0);
+        var waited_ms: u32 = 0;
+        var reaped = false;
+        while (waited_ms < 2000) {
+            const r = linux.waitpid(child_pid, &status, linux.W.NOHANG);
+            const e = sandbox.errnoFromSyscall(r);
+            if (e == .SUCCESS) {
+                reaped = true;
+                break;
+            }
+            if (e == .CHILD) break; // already gone
+            sandbox.sleepNs(0, 10_000_000);
+            waited_ms += 10;
+        }
+        if (!reaped) {
+            _ = linux.kill(child_pid, linux.SIG.KILL);
+            _ = linux.waitpid(child_pid, &status, 0);
+        }
     }
     // Don't destroy an interrupted session's work: stash it and say where.
     stashInteractiveChanges();

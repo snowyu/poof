@@ -1836,12 +1836,26 @@ describe("poof CLI", () => {
   // Signals sent to poof itself
   // ============================================================================
   describe("signals to poof", () => {
-    test("SIGTERM exits 143 after cleaning up the sandbox", async () => {
-      const proc = spawn([POOF_BIN, "exec", "--", "sleep", "30"], { stdout: "ignore", stderr: "ignore" });
-      await Bun.sleep(500);
-      proc.kill(15);
-      expect(await proc.exited).toBe(143);
-    });
+    // A signal has to survive the chain poof -> namespace parent -> namespace init ->
+    // command, and the init only learns the command's pid a moment after forking it.
+    // A TERM landing inside that window used to be dropped, leaving every hop waiting
+    // on the next one forever. A single shot at one delay misses the window on an idle
+    // machine, so probe several points in startup and bound the exit: never exiting is
+    // the failure mode here, not a wrong code.
+    test("SIGTERM at any point in startup exits 143 rather than hanging", async () => {
+      for (const delay of [200, 400, 600, 800, 1000]) {
+        const proc = spawn([POOF_BIN, "exec", "--", "sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+        await Bun.sleep(delay);
+        proc.kill(15);
+        const code = await Promise.race([proc.exited, Bun.sleep(4000).then(() => null)]);
+        if (code === null) {
+          try { proc.kill(9); } catch {}
+          await proc.exited;
+          throw new Error(`poof never exited after SIGTERM sent ${delay}ms after spawn`);
+        }
+        expect(code).toBe(143);
+      }
+    }, 30000);
 
     test("SIGINT exits 130", async () => {
       const proc = spawn([POOF_BIN, "exec", "--", "sleep", "30"], { stdout: "ignore", stderr: "ignore" });
