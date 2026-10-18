@@ -83,8 +83,8 @@ class TerminalSession {
     }
   }
 
-  kill() {
-    this.proc.kill();
+  kill(signal: number = 15) {
+    this.proc.kill(signal);
   }
 
   async waitForExit() {
@@ -1874,6 +1874,31 @@ describe("poof CLI", () => {
       expect(await proc.exited).toBe(130);
     });
 
+    // A session interrupted mid-work never reached the apply prompt, so its upper
+    // dir has to survive the signal and stay findable: the work is only recoverable
+    // if poof both says where it is and lists it again later.
+    test("SIGINT in an interactive session keeps its changes in a listed stash", async () => {
+      const dir = mkdtempSync(join(TEST_DIR, "sigint-"));
+      const made = join(dir, "sigint-kept.txt");
+      const session = new TerminalSession(dir, undefined, [], "run");
+
+      await session.waitForNew(SHELL_PROMPT);
+      session.write(`echo kept > ${made}\n`);
+      await session.waitForNew(SHELL_PROMPT);
+      session.kill(2);
+
+      expect(await session.waitForExit()).toBe(130);
+      expect(session.output).toContain("Stashed changes in");
+      const stash = stashPath(session.output);
+      expect(stash).not.toBeNull();
+      expect(readFileSync(join(stash!, made), "utf-8").trim()).toBe("kept");
+
+      const listed = spawnSync([POOF_BIN, "stash", "list"]);
+      expect(listed.stdout.toString() + listed.stderr.toString()).toContain(stash!);
+
+      cleanupStash(session.output);
+      rmSync(dir, { recursive: true, force: true });
+    }, 20000);
   });
 
   // ============================================================================
