@@ -488,8 +488,9 @@ POOF_TEST_APT=git ./scripts/test-docker.sh      # also cover the git-repo cases
 ```
 
 The script starts a privileged container, moves it onto a plain tmpfs root (poof
-cannot overlay a container's overlayfs root), turns on cgroup delegation, then
-builds with the host's zig and bun bind mounted and runs the whole suite as root.
+cannot overlay a container's overlayfs root), turns on cgroup delegation, builds
+with the host's zig and bun bind mounted, and runs the unit tests and the whole
+integration suite as root.
 Cases whose prerequisites are missing - no root, no CAP_MKNOD, no cgroup
 delegation, no git - skip instead of failing.
 

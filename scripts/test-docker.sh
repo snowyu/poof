@@ -110,5 +110,11 @@ umount -l /oldroot
 export ZIG_GLOBAL_CACHE_DIR=/zig-cache
 cd /work
 /opt/zig/zig build -Dgit-commit="$GIT_COMMIT"
+# The unit tests are pure logic over strings, so root and the kernel overlay buy
+# them nothing; running them here anyway is what proves this same checkout
+# compiles and passes against the container's zig. --summary all because a
+# passing `zig build test` prints nothing, and a log with no trace of a step
+# reads like a step that never ran.
+/opt/zig/zig build test --summary all
 bun test "$@"
 INNER
