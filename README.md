@@ -112,7 +112,7 @@ curl -s https://example.com/setup.sh | poof exec bash
 
 ### `run` — Interactive by default
 
-When run interactively (tty), shows the change list and prompts to apply them — just like `enter` but with any command. When run non-interactively (scripts/pipes), the changes are kept in a stash named after the command, which you replay later with `poof apply`.
+When run interactively (tty), shows the change list and prompts to apply them — just like `enter` but with any command. When run non-interactively (scripts/pipes), the changes are kept in a stash under `/tmp/poof-<hex>` — the same place an interactive session leaves one — which `poof stash list` finds and `poof apply` replays.
 
 ```bash
 # Let Claude edit your code, review changes before applying

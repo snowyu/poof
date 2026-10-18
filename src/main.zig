@@ -65,23 +65,6 @@ fn clockSecs(clk: posix.clockid_t) ?i64 {
     return ts.sec;
 }
 
-fn generateTimestamp() ![]const u8 {
-    const secs: u64 = @intCast(clockSecs(posix.CLOCK.REALTIME) orelse return error.ClockError);
-    const epoch = std.time.epoch.EpochSeconds{ .secs = secs };
-    const day = epoch.getDaySeconds();
-    const yd = epoch.getEpochDay().calculateYearDay();
-    const md = yd.calculateMonthDay();
-
-    return try std.fmt.allocPrint(allocator, "{d}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}", .{
-        yd.year,
-        md.month.numeric(),
-        md.day_index + 1,
-        day.getHoursIntoDay(),
-        day.getMinutesIntoHour(),
-        day.getSecondsIntoMinute(),
-    });
-}
-
 // C library functions for terminal control
 extern "c" fn tcsetpgrp(fd: c_int, pgrp: c_int) c_int;
 extern "c" fn getpgrp() c_int;
@@ -1492,30 +1475,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             };
             config.enter_target = cwd; // Triggers y/n/d prompt on exit
         } else {
-            // Non-interactive without --upper: auto-generate from command name
-            const cmd_name = std.fs.path.basename(config.command[0]);
-            const base_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, cmd_name }) catch {
-                err("out of memory", .{});
+            // Non-interactive without --upper: stash under /tmp/poof-<hex>, the same
+            // place an interactive session leaves its changes. Naming the stash after
+            // the command and dropping it in the working directory put it where
+            // `poof stash list` cannot see it (that matches only poof-<16 hex>) and
+            // littered the user's project with a directory called after whatever they
+            // happened to run.
+            config.upper_dir = sandbox.makeTempDir() catch |e| {
+                err("cannot create stash directory: {}", .{e});
                 return 1;
             };
-
-            // Check if base path exists, if so append timestamp
-            if (sandbox.pathExists(base_path)) {
-                const ts = generateTimestamp() catch {
-                    err("clock error", .{});
-                    return 1;
-                };
-                config.upper_dir = std.fmt.allocPrint(allocator, "{s}.{s}", .{ base_path, ts }) catch {
-                    err("out of memory", .{});
-                    return 1;
-                };
-            } else {
-                config.upper_dir = base_path;
-            }
 
             const hc = col(Color.bold ++ Color.cyan);
             const rc = col(Color.reset);
             info("Changes will be kept in {s}{s}{s}", .{ hc, config.upper_dir.?, rc });
+            info("replay them with: poof apply {s}", .{config.upper_dir.?});
         }
     }
 

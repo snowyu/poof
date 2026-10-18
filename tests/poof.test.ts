@@ -760,39 +760,55 @@ describe("poof CLI", () => {
       });
     });
 
-    describe("auto-generated upper (non-interactive)", () => {
-      test("uses command name as directory", () => {
-        const result = spawnSync([POOF_BIN, "run", "true"], { cwd: runTestDir });
+    describe("auto-generated stash (non-interactive)", () => {
+      // "Changes will be kept in <dir>" is printed before the run starts; pull the
+      // path out of the (possibly colorized) output so the tests can assert on it.
+      function keptPath(output: string): string | null {
+        const m = output.match(/Changes will be kept in(?:\u001b\[[0-9;]*m)?\s+(\S+)/);
+        return m ? m[1] : null;
+      }
+
+      function removeStash(stash: string) {
+        rmSync(stash, { recursive: true, force: true });
+        rmSync(stash + ".work", { recursive: true, force: true });
+      }
+
+      // The stash has to land where `poof stash list` can find it. Naming it after
+      // the command and dropping it in the working directory left it out of the
+      // listing and littered the project with a directory called after the command.
+      test("stashes under /tmp/poof-<hex>, not in the working directory", () => {
+        const before = readdirSync(runTestDir);
+
+        const result = spawnSync([
+          POOF_BIN, "run", "sh", "-c", `echo hi > ${runTestDir}/stash-src.txt`
+        ], { cwd: runTestDir });
         const output = result.stderr.toString();
-        expect(output).toContain("Changes will be kept in");
-        expect(output).toContain("/true");
         expect(result.exitCode).toBe(0);
 
-        // Cleanup
-        rmSync(join(runTestDir, "true"), { recursive: true, force: true });
-        rmSync(join(runTestDir, "true.work"), { recursive: true, force: true });
+        const stash = keptPath(output);
+        expect(stash).not.toBeNull();
+        expect(stash!).toMatch(/^\/tmp\/poof-[0-9a-f]{16}$/);
 
+        // the sandbox write never reaches the host, and no directory named after the
+        // command is left in the working directory
+        expect(readdirSync(runTestDir)).toEqual(before);
+        expect(existsSync(join(runTestDir, "sh"))).toBe(false);
+        expect(existsSync(join(runTestDir, "stash-src.txt"))).toBe(false);
+
+        removeStash(stash!);
       });
 
-      test("adds timestamp when directory exists", () => {
-        // Create directory to force timestamp
-        const existingDir = join(runTestDir, "echo");
-        mkdirSync(existingDir);
+      test("poof stash list finds the auto stash", () => {
+        const result = spawnSync([
+          POOF_BIN, "run", "sh", "-c", `echo hi > ${runTestDir}/listed.txt`
+        ], { cwd: runTestDir });
+        const stash = keptPath(result.stderr.toString());
+        expect(stash).not.toBeNull();
 
-        const result = spawnSync([POOF_BIN, "run", "echo", "hi"], { cwd: runTestDir });
-        const output = result.stderr.toString();
-        expect(output).toMatch(/echo\.\d{14}/);
+        const listed = spawnSync([POOF_BIN, "stash", "list"]);
+        expect(listed.stdout.toString() + listed.stderr.toString()).toContain(stash!);
 
-        // Cleanup
-        rmSync(existingDir, { recursive: true, force: true });
-        // Find and clean the timestamped dir
-        const dirs = spawnSync(["sh", "-c", `ls -d ${runTestDir}/echo.* 2>/dev/null || true`])
-          .stdout.toString().trim().split("\n").filter(Boolean);
-        for (const dir of dirs) {
-          rmSync(dir, { recursive: true, force: true });
-          rmSync(dir + ".work", { recursive: true, force: true });
-
-        }
+        removeStash(stash!);
       });
     });
 
