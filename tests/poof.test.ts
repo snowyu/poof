@@ -192,14 +192,18 @@ describe("poof CLI", () => {
       expect(result.exitCode).toBe(1);
     });
 
-    test("missing command shows help on stderr", () => {
-      const result = spawnSync([POOF_BIN, "exec"]);
-      const output = result.stderr.toString();
-      expect(output).toContain("poof exec");
-      expect(output).toContain("USAGE");
-      // A usage error is not the requested result: keep it off stdout.
-      expect(result.stdout.toString()).toBe("");
-      expect(result.exitCode).toBe(1);
+    // There is no "a command is required" error any more: no command means a
+    // shell, and the keep flags decide what happens to its changes.
+    test("no command is a shell, not a usage error", () => {
+      const result = spawnSync([POOF_BIN, "--no-keep"]);
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr.toString()).not.toContain("Changes will be kept in");
+    });
+
+    test("a known shell is a command, not a login shell", () => {
+      const result = spawnSync([POOF_BIN, "bash", "-c", "echo ran"]);
+      expect(result.stdout.toString()).toContain("ran");
+      expect(result.exitCode).toBe(0);
     });
   });
 
@@ -1869,11 +1873,22 @@ describe("poof CLI", () => {
   // Option interaction
   // ============================================================================
   describe("option interaction", () => {
-    test("--upper warns when the mode ignores it", () => {
-      for (const mode of ["exec", "enter"]) {
-        const result = spawnSync([POOF_BIN, mode, "--upper=/var/tmp/poof-unused-upper", "--", "true"]);
-        expect(result.stderr.toString()).toContain("only used by run mode");
-      }
+    test("--keep and --no-keep conflict", () => {
+      const result = spawnSync([POOF_BIN, "--no-keep", "--keep=/var/tmp/poof-conflict", "--", "true"]);
+      expect(result.stderr.toString()).toContain("--keep and --no-keep conflict");
+      expect(result.exitCode).toBe(1);
+    });
+
+    test("--yes with --no-keep is refused", () => {
+      const result = spawnSync([POOF_BIN, "--no-keep", "--yes", "--", "true"]);
+      expect(result.stderr.toString()).toContain("--yes has nothing to apply");
+      expect(result.exitCode).toBe(1);
+    });
+
+    test("--yes with --keep=<dir> is refused", () => {
+      const result = spawnSync([POOF_BIN, "--keep=/var/tmp/poof-conflict", "--yes", "--", "true"]);
+      expect(result.stderr.toString()).toContain("already says where to apply");
+      expect(result.exitCode).toBe(1);
     });
 
     test("--upper= with an empty value is rejected", () => {
@@ -1914,6 +1929,116 @@ describe("poof CLI", () => {
       ]);
       expect(result.exitCode).toBe(3);
       expect(readFileSync(join(upper, target), "utf-8").trim()).toBe("kept");
+    });
+  });
+
+  // ============================================================================
+  // Keep disposition
+  //
+  // --no-keep / --keep=<dir> / --yes are the whole interface now, so these pin
+  // the disposition itself: where the changes are once the command exits, and
+  // whether they ever reach the real directory.
+  // ============================================================================
+  describe("keep disposition", () => {
+    let dir: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(TEST_DIR, "keep-"));
+    });
+
+    afterEach(() => {
+      if (dir && existsSync(dir)) rmSync(dir, { recursive: true });
+    });
+
+    test("the default keeps the changes rather than writing them", () => {
+      const target = join(dir, "default.txt");
+      const result = spawnSync([POOF_BIN, "sh", "-c", `echo kept > ${target}`], { cwd: dir });
+      const output = result.stderr.toString();
+
+      expect(output).toContain("Changes will be kept in");
+      expect(existsSync(target)).toBe(false);
+
+      const stash = output.match(/Changes will be kept in (\/\S+)/)?.[1];
+      expect(stash).toBeDefined();
+      const applied = spawnSync([POOF_BIN, "apply", stash!, "--yes"]);
+      expect(applied.exitCode).toBe(0);
+      expect(readFileSync(target, "utf-8").trim()).toBe("kept");
+    });
+
+    test("--no-keep destroys the changes", () => {
+      const target = join(dir, "gone.txt");
+      const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", `echo x > ${target}`], { cwd: dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(existsSync(target)).toBe(false);
+      expect(result.stderr.toString()).not.toContain("Changes will be kept in");
+    });
+
+    test("--keep=<dir> stores the changes there and applies nothing", () => {
+      const stash = join(dir, "my-stash");
+      const target = join(dir, "stored.txt");
+      const result = spawnSync([POOF_BIN, `--keep=${stash}`, "sh", "-c", `echo d > ${target}`], { cwd: dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(join(stash, target), "utf-8").trim()).toBe("d");
+      expect(existsSync(target)).toBe(false);
+    });
+
+    test("--keep=<dir> is relative to the working directory", () => {
+      const target = join(dir, "rel.txt");
+      const result = spawnSync([POOF_BIN, "--keep=rel-stash", "sh", "-c", `echo r > ${target}`], { cwd: dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(join(dir, "rel-stash", target), "utf-8").trim()).toBe("r");
+    });
+
+    test("--yes applies at exit without asking", () => {
+      const target = join(dir, "auto.txt");
+      const result = spawnSync([POOF_BIN, "--yes", "sh", "-c", `echo a > ${target}`], { cwd: dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(readFileSync(target, "utf-8").trim()).toBe("a");
+      expect(result.stderr.toString()).toContain("Changes applied successfully");
+    });
+
+    test("--yes leaves no stash behind", () => {
+      const before = listPoofStashes();
+      const result = spawnSync([POOF_BIN, "--yes", "sh", "-c", "echo a > auto.txt"], { cwd: dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(listPoofStashes().filter((p) => !before.includes(p))).toEqual([]);
+    });
+
+    test("a failing command still keeps its changes for review", () => {
+      const target = join(dir, "fail.txt");
+      const result = spawnSync([POOF_BIN, "sh", "-c", `echo f > ${target} && exit 5`], { cwd: dir });
+
+      expect(result.exitCode).toBe(5);
+      expect(existsSync(target)).toBe(false);
+      expect(result.stderr.toString()).toContain("Changes will be kept in");
+    });
+
+    test("--keep= with an empty value is rejected", () => {
+      const result = spawnSync([POOF_BIN, "--keep=", "--", "true"]);
+      expect(result.stderr.toString()).toContain("not a directory");
+      expect(result.exitCode).toBe(1);
+    });
+
+    // The aliases keep their old argument shapes (enter still takes a directory,
+    // not a command); only the disposition is now spelled with flags.
+    test("the old mode words still work, and warn", () => {
+      for (const argv of [["exec", "--", "true"], ["run", "--", "true"], ["enter"]]) {
+        const result = spawnSync([POOF_BIN, ...argv], { cwd: dir });
+        expect(result.stderr.toString()).toContain(`'poof ${argv[0]}' is deprecated`);
+        expect(result.exitCode).toBe(0);
+      }
+    });
+
+    test("--upper still works, and warns", () => {
+      const upper = join(dir, "upper-stash");
+      const result = spawnSync([POOF_BIN, `--upper=${upper}`, "--", "true"]);
+      expect(result.stderr.toString()).toContain("--upper is deprecated");
+      expect(result.exitCode).toBe(0);
     });
   });
 });

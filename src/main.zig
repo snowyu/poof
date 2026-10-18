@@ -16,7 +16,12 @@ const git_commit_explicit = options.git_commit_explicit;
 // Re-exports from modules
 const allocator = sandbox.allocator;
 const Config = sandbox.Config;
-const Mode = sandbox.Mode;
+const Keep = sandbox.Keep;
+const ApplyAtExit = sandbox.ApplyAtExit;
+
+// The old mode words, still accepted. They named a disposition of the changes, not a
+// kind of sandbox - the sandbox is the same in every case - so they are now flags.
+const Alias = enum { exec, run, enter };
 
 const step = output.step;
 const vstep = output.vstep;
@@ -374,10 +379,12 @@ fn printChanges(changes: []const Change, upper_dir: []const u8) void {
     }
 }
 
-// Handle enter mode - show changes and prompt to apply
-fn handleEnterModeChanges(config: Config) void {
+// Deal with a session's changes at exit: apply them straight away when the session
+// said to (--yes), otherwise show the list and ask. A session that only stashed its
+// changes never gets here; `poof apply <stash>` is how those come back.
+fn handleExitApply(config: Config) void {
     const upper_dir = config.upper_dir orelse return;
-    const target_dir = config.enter_target orelse return;
+    const target_dir = config.apply_target orelse return;
 
     // Reclaim the terminal - the child shell was the foreground process group
     reclaimTerminal();
@@ -416,6 +423,12 @@ fn handleEnterModeChanges(config: Config) void {
     print("\n", .{});
     printChanges(changes.items[0..changes.len], upper_dir);
     print("\n", .{});
+
+    if (config.apply_at_exit == .always) {
+        // --yes: the list above is the notice, there is no question to ask.
+        applyChanges(changes_path, target_dir);
+        return;
+    }
 
     // Prompt user
     const c1 = col(Color.bold_yellow);
@@ -472,8 +485,8 @@ fn hasDirEntries(path: []const u8) bool {
     return dir.next() != null;
 }
 
-// An interactive session that was killed (timeout/signal) never got to prompt,
-// so keep its upper dir and tell the user where to find it.
+// A session that was killed (timeout/signal) never got to apply or prompt, so keep
+// its upper dir and tell the user where to find it.
 fn stashInteractiveChanges() void {
     const upper_dir = interactive_upper orelse return;
     const changes_path = interactive_changes_path orelse return;
@@ -883,11 +896,11 @@ pub fn run(config: Config) u8 {
     const orig_gid = linux.getgid();
 
     // Show startup info (minimal unless verbose)
-    if (config.mode == .exec) {
+    if (config.keep == .none) {
         vstep("Starting ephemeral environment", .{});
-    } else if (config.enter_target != null) {
-        // Interactive mode (enter or run without --upper)
-        vstep("Entering poof mode for {s}", .{config.enter_target.?});
+    } else if (config.apply_target != null) {
+        // The session will deal with its changes for this directory on exit
+        vstep("Starting session, changes for {s} kept in {s}", .{ config.apply_target.?, config.upper_dir orelse "(temp)" });
     } else {
         vstep("Starting session, changes kept in {s}", .{config.upper_dir orelse "(temp)"});
     }
@@ -921,14 +934,14 @@ pub fn run(config: Config) u8 {
     }
 
     // Set up cleanup paths BEFORE fork (child sets globals but parent does cleanup)
-    if (config.mode == .exec) {
-        // For exec: create temp dir now so parent knows the path to clean up
+    if (config.keep == .none) {
+        // --no-keep: create temp dir now so parent knows the path to clean up
         sandbox.cleanup_temp_base = sandbox.makeTempDir() catch |e| {
             err("makeTempDir: {}", .{e});
             return 1;
         };
-    } else if (config.mode == .run or config.mode == .enter) {
-        // For run/enter: .work sits next to the user's upper dir (kernel overlay wants
+    } else {
+        // Keeping changes: .work sits next to the upper dir (kernel overlay wants
         // upper and work on one filesystem); the merged mount point goes into a private
         // temp base so it stays invisible from inside the sandbox.
         sandbox.cleanup_work_dir = std.fmt.allocPrint(allocator, "{s}.work", .{config.upper_dir.?}) catch null;
@@ -936,19 +949,20 @@ pub fn run(config: Config) u8 {
             err("makeTempDir: {}", .{e});
             return 1;
         };
-        // For enter mode (and interactive run), also clean up the temp upper dir
-        if (config.enter_target != null) {
+        // A session that applies at exit owns its stash: it goes once the changes are
+        // on the host. Declining the prompt clears this (keepChanges) instead.
+        if (config.apply_at_exit != .never) {
             sandbox.cleanup_temp_base = config.upper_dir;
         }
     }
 
-    // Remember what an abnormal exit must stash (interactive run/enter only)
-    if (config.enter_target != null) {
+    // Remember what an abnormal exit must stash (a session that would have applied)
+    if (config.apply_at_exit != .never) {
         interactive_upper = config.upper_dir;
         interactive_changes_path = std.fmt.allocPrint(
             allocator,
             "{s}{s}",
-            .{ config.upper_dir.?, config.enter_target.? },
+            .{ config.upper_dir.?, config.apply_target.? },
         ) catch null;
     }
 
@@ -1008,9 +1022,9 @@ pub fn run(config: Config) u8 {
             const result = waitChild(child_pid, 0);
             sandbox.cleanupCgroup();
 
-            // Handle interactive mode - prompt to apply changes before cleanup
-            if (config.enter_target != null) {
-                handleEnterModeChanges(config);
+            // The session asked for its changes to be dealt with on exit
+            if (config.apply_target != null) {
+                handleExitApply(config);
             }
 
             sandbox.cleanupOverlayDirs();
@@ -1055,7 +1069,7 @@ fn printApplyHelp() void {
 
     print("\n{s}USAGE{s}\n", .{ B, R });
     print("  {s}poof apply{s} [options] <stash>\n", .{ C, R });
-    print("  {s}poof run --apply=<stash>{s}     the same, script-friendly\n", .{ C, R });
+    print("  {s}poof --apply=<stash>{s}        the same, script-friendly\n", .{ C, R });
 
     print("\n{s}EXAMPLES{s}\n", .{ B, R });
     print("  $ poof stash list                  {s}# find stashes{s}\n", .{ D, R });
@@ -1075,7 +1089,7 @@ fn printApplyHelp() void {
     print("  {s}-h, --help{s}                 Show this help\n", .{ C, R });
 }
 
-fn printModeHelp(mode: sandbox.Mode) void {
+fn printModeHelp(mode: Alias) void {
     const C = col(Color.cyan);
     const B = col(Color.bold);
     const BB = col(Color.bold_blue);
@@ -1084,6 +1098,15 @@ fn printModeHelp(mode: sandbox.Mode) void {
     const RE = col(Color.red);
     const D = col(Color.dim);
     const R = col(Color.reset);
+
+    // The mode words stay so muscle memory and existing scripts keep working; what
+    // the changes do is spelled with flags now, so say so before the old help.
+    const replacement = switch (mode) {
+        .exec => "poof --no-keep <program>",
+        .run => "poof <program>",
+        .enter => "poof, with no command",
+    };
+    print("\n  {s}deprecated{s} — the same thing with flags: {s}{s}{s}\n", .{ Y, R, C, replacement, R });
 
     switch (mode) {
         .exec => {
@@ -1119,7 +1142,8 @@ fn printModeHelp(mode: sandbox.Mode) void {
             print("    {s}n{s} — Discard (keep in temp dir)\n", .{ G, R });
             print("    {s}d{s} — Show full diff first\n", .{ G, R });
             print("\n{s}OPTIONS{s}\n", .{ B, R });
-            print("  {s}--upper=<dir>{s}       Keep changes in <dir>, skip the prompt\n", .{ G, R });
+            print("  {s}--keep=<dir>{s}        Keep changes in <dir>, skip the prompt\n", .{ G, R });
+            print("  {s}--yes{s}             Apply them to the host as the command exits\n", .{ G, R });
             print("  {s}--timeout=<secs>{s}    Kill after N seconds\n", .{ G, R });
             print("  {s}--memory=<size>{s}     Memory limit (e.g. 100M, 1G)\n", .{ G, R });
             print("  {s}--pids=<max>{s}        Max processes\n", .{ G, R });
@@ -1168,16 +1192,28 @@ fn printUsage() void {
     // Usage & Commands
     print(
         \\{s}USAGE{s}
-        \\  {s}poof{s} {s}<command>{s} [options] [--] {s}<program>{s} [args...]
+        \\  {s}poof{s} [options] [--] {s}<program>{s} {s}[args...]{s}
+        \\  {s}poof{s} [options]                     {s}interactive shell{s}
+        \\
+        \\{s}CHANGES{s}
+        \\  poof never writes to the real directory unless you say so. These flags
+        \\  decide what happens to the changes a command makes:
+        \\    {s}(default){s}      keep them in a /tmp stash, replay with {s}poof apply{s}
+        \\    {s}--no-keep{s}      destroy them when the command exits
+        \\    {s}--keep=<dir>{s}   keep them in <dir> instead of a /tmp stash
+        \\    {s}--yes{s}          apply them to the real directory as the command exits
+        \\
+    , .{ B, R, C, R, Y, R, G, R, C, R, D, R, B, R, C, R, D, R, C, R, C, R, C, R });
+
+    // Subcommands, and the mode words that are no longer needed
+    print(
         \\
         \\{s}COMMANDS{s}
-        \\  {s}exec{s}  <program>             Run in ephemeral mode {s}(changes vanish){s}
-        \\  {s}run{s}   <program>             Review & apply on exit {s}(--upper=<dir> keeps a stash){s}
-        \\  {s}enter{s}                       Interactive $SHELL {s}(review & apply on exit){s}
-        \\  {s}apply{s} <stash>              Replay a saved upper dir onto the host
+        \\  {s}apply{s} <stash>              Replay a saved stash onto the host
         \\  {s}stash{s} list                 List stashes left in /tmp
+        \\  {s}exec{s} / {s}run{s} / {s}enter{s}         Deprecated mode words, still accepted
         \\
-    , .{ B, R, C, R, Y, R, G, R, B, R, C, R, D, R, C, R, D, R, C, R, D, R, C, R, C, R });
+    , .{ B, R, C, R, C, R, C, R, C, R, C, R });
 
     // Options
     print(
@@ -1185,12 +1221,12 @@ fn printUsage() void {
         \\  {s}-v, --verbose{s}               Show detailed progress
         \\  {s}-h, --help{s}                  Show this help
         \\  {s}-V, --version{s}               Show version
-        \\  {s}--upper=<dir>{s}               Directory for changes {s}(run mode){s}
-        \\  {s}--timeout=<secs>{s}            Kill after N seconds
+        \\  {s}--timeout=<secs>{s}            Kill after N seconds {s}(exit code 124){s}
         \\  {s}--memory=<bytes>{s}            Memory limit {s}(e.g. 100M, 1G){s}
         \\  {s}--pids=<max>{s}                Max processes {s}(fork bomb protection){s}
+        \\  {s}--upper=<dir>{s}               Deprecated: use {s}--keep=<dir>{s}
         \\
-    , .{ B, R, G, R, G, R, G, R, G, R, D, R, G, R, G, R, D, R, G, R, D, R });
+    , .{ B, R, G, R, G, R, G, R, G, R, D, R, G, R, D, R, G, R, D, R, G, R, G, R });
 
     // Isolation
     print(
@@ -1205,15 +1241,19 @@ fn printUsage() void {
     // Examples
     print(
         \\{s}EXAMPLES{s}
-        \\  {s}${s} poof exec claude --dangerously-skip-permissions
-        \\  {s}${s} poof exec rm -rf ~                {s}# Safe! Nothing happens{s}
-        \\  {s}${s} poof run bun install              {s}# Review changes first{s}
+        \\  {s}${s} poof bun install              {s}# kept; replay with poof apply{s}
+        \\  {s}${s} poof --yes make               {s}# applied as soon as it exits{s}
+        \\  {s}${s} poof --no-keep rm -rf ~       {s}# Safe! Nothing happens{s}
+        \\  {s}${s} poof                          {s}# a shell, reviewed on exit{s}
         \\
+    , .{ B, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R, D, R });
+
+    print(
         \\{s}NOTE{s}  Works inside Docker/Podman {s}(1 nesting level, kernel limit){s}
         \\{s}ENV{s}   IS_SANDBOX=1 is set inside the sandbox
         \\
         \\
-    , .{ B, R, D, R, D, R, D, R, D, R, D, R, Y, R, D, R, G, R });
+    , .{ Y, R, D, R, G, R });
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -1224,22 +1264,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 1;
     };
 
-    // No args = enter mode (interactive shell)
-    if (args.len < 2) {
-        // Fall through to enter mode below
-    }
-
     var cwd_buf: [4096]u8 = undefined;
     const cwd = getHostCwd(&cwd_buf);
 
     var config = Config{
-        .mode = .exec,
         .command = &.{},
         .cwd = cwd,
     };
 
-    var upper_dir: ?[]const u8 = null;
-    var mode: ?Mode = null;
+    var keep_dir: ?[]const u8 = null;
+    var used_upper = false;
+    var no_keep = false;
+    var alias: ?Alias = null;
     var sub: ?Subcommand = null;
     var apply_opt: ?[]const u8 = null;
     var assume_yes = false;
@@ -1252,7 +1288,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             // Help is the requested result, so it goes to stdout (exit 0).
             output.routeToStdout(true);
-            if (sub != null and sub.? == .apply) printApplyHelp() else if (mode) |m| printModeHelp(m) else printUsage();
+            if (sub != null and sub.? == .apply) printApplyHelp() else if (alias) |a| printModeHelp(a) else printUsage();
             output.routeToStdout(false);
             return 0;
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
@@ -1262,8 +1298,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 0;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             output.setVerbose(true);
+        } else if (std.mem.startsWith(u8, arg, "--keep=")) {
+            keep_dir = arg[7..];
         } else if (std.mem.startsWith(u8, arg, "--upper=")) {
-            upper_dir = arg[8..];
+            // The old name for --keep: it named the overlay mechanism, not the intent.
+            keep_dir = arg[8..];
+            used_upper = true;
+        } else if (std.mem.eql(u8, arg, "--no-keep")) {
+            no_keep = true;
         } else if (std.mem.startsWith(u8, arg, "--apply=")) {
             if (arg[8..].len == 0) {
                 err("invalid apply: (use --apply=<stash dir>)", .{});
@@ -1313,16 +1355,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             cmd_start = i + 1;
             break;
         } else if (std.mem.eql(u8, arg, "exec")) {
-            mode = .exec;
+            alias = .exec;
         } else if (std.mem.eql(u8, arg, "run")) {
-            mode = .run;
+            alias = .run;
         } else if (std.mem.eql(u8, arg, "enter")) {
-            mode = .enter;
-        } else if (std.mem.eql(u8, arg, "apply") and mode == null) {
-            // Only a subcommand while no mode is set, so `poof exec apply` still
-            // runs a program called apply.
+            alias = .enter;
+        } else if (std.mem.eql(u8, arg, "apply") and alias == null) {
+            // Only a subcommand while no mode word precedes it, so `poof exec apply`
+            // still runs a program called apply.
             sub = .apply;
-        } else if (std.mem.eql(u8, arg, "stash") and mode == null) {
+        } else if (std.mem.eql(u8, arg, "stash") and alias == null) {
             sub = .stash;
         } else if (arg.len > 0 and arg[0] != '-') {
             if (sub != null) {
@@ -1345,6 +1387,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // Subcommands work on a previous session's stash; they never start a sandbox.
     if (sub) |s| {
+        if (no_keep or keep_dir != null) warn("--keep/--no-keep configure a session; ignored for a subcommand", .{});
         switch (s) {
             .apply => {
                 const target = apply_opt orelse sub_arg;
@@ -1367,43 +1410,39 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    if (assume_yes) warn("--yes is only used by apply; ignored", .{});
-
-    if (mode == null) {
-        // Check if first arg is a known shell - treat as `poof exec <shell>`
-        if (cmd_start < args.len) {
-            const first_cmd = args[cmd_start];
-            // Get basename of command
-            const basename = if (std.mem.lastIndexOfScalar(u8, first_cmd, '/')) |idx|
-                first_cmd[idx + 1 ..]
-            else
-                first_cmd;
-
-            if (std.mem.eql(u8, basename, "bash") or
-                std.mem.eql(u8, basename, "zsh") or
-                std.mem.eql(u8, basename, "fish") or
-                std.mem.eql(u8, basename, "sh"))
-            {
-                mode = .exec;
-            }
-        }
-
-        // Default to enter mode (interactive shell)
-        if (mode == null) {
-            mode = .enter;
+    // Deprecation notices for the old mode words. They come after the parse loop so
+    // that --help and --version stay clean on stdout.
+    if (alias) |a| {
+        switch (a) {
+            .exec => warn("'poof exec' is deprecated: poof --no-keep <program> does this", .{}),
+            .run => warn("'poof run' is deprecated: poof <program> does this", .{}),
+            .enter => warn("'poof enter' is deprecated: poof with no command does this", .{}),
         }
     }
+    if (used_upper) warn("--upper is deprecated: use --keep=<dir>", .{});
 
-    config.mode = mode.?;
-    config.verbose = output.isVerbose();
+    // Axis one: what happens to the changes once the session ends.
+    if (no_keep and keep_dir != null) {
+        err("--keep and --no-keep conflict: --keep=<dir> stores the changes, --no-keep destroys them", .{});
+        return 1;
+    }
+    config.keep = if (no_keep) .none else if (keep_dir != null) .dir else .auto;
 
-    // --upper only means anything for run mode; say so instead of dropping it.
-    if (upper_dir != null and config.mode != .run) {
-        warn("--upper is only used by run mode; ignored for {s} mode", .{@tagName(config.mode)});
+    // `poof enter <dir>` took a directory where every other form takes a command. That
+    // quirk survives only with the deprecated word; the plain form is `cd <dir> && poof`.
+    var enter_dir: ?[]const u8 = null;
+    if (alias == .enter and cmd_start < args.len) {
+        if (cmd_start + 1 < args.len) {
+            err("enter takes at most one directory, got extra argument: {s}", .{args[cmd_start + 1]});
+            return 1;
+        }
+        enter_dir = args[cmd_start];
+        cmd_start = args.len; // consumed: it is a directory, not a command
     }
 
-    // Handle enter mode specially - uses $SHELL, no command needed
-    if (config.mode == .enter) {
+    if (cmd_start >= args.len) {
+        // No command: the session is a shell. This is what `enter` used to name; the
+        // disposition of the changes comes from the flags, not from the shell.
         const shell = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else "/bin/sh";
         const shell_args = allocator.alloc([]const u8, 1) catch {
             err("out of memory", .{});
@@ -1412,14 +1451,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         shell_args[0] = shell;
         config.command = shell_args;
 
-        // `poof enter <directory>` — sandbox that directory instead of the cwd.
         var target = cwd;
-        if (cmd_start < args.len) {
-            if (cmd_start + 1 < args.len) {
-                err("enter takes at most one directory, got extra argument: {s}", .{args[cmd_start + 1]});
-                return 1;
-            }
-            const arg_dir = args[cmd_start];
+        if (enter_dir) |arg_dir| {
             target = if (arg_dir.len > 0 and arg_dir[0] == '/')
                 arg_dir
             else if (std.mem.eql(u8, cwd, "/"))
@@ -1437,28 +1470,45 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 return 1;
             }
         }
-        config.enter_target = target;
         config.cwd = target;
-
-        // Create temp upper dir for enter mode
-        config.upper_dir = sandbox.makeTempDir() catch {
-            err("failed to create temp dir", .{});
-            return 1;
-        };
     } else {
-        if (cmd_start >= args.len) {
-            printModeHelp(config.mode);
-            return 1;
-        }
         config.command = args[cmd_start..];
     }
 
-    // Determine upper directory for run mode
-    if (config.mode == .run) {
-        const is_interactive = std.c.isatty(std.posix.STDIN_FILENO) == 1;
+    // Axis two: when the changes get replayed onto the host. A shell session is
+    // interactive by nature, so it asks even when stdin is not a terminal; a scripted
+    // command leaves its stash for `poof apply` instead, and --keep=<dir> means the
+    // caller chose where the stash goes and will replay it by path.
+    if (assume_yes and config.keep == .none) {
+        err("--yes has nothing to apply: --no-keep destroys the changes", .{});
+        return 1;
+    }
+    if (assume_yes and config.keep == .dir) {
+        err("--yes and --keep=<dir> conflict: --keep already says where to apply the changes", .{});
+        return 1;
+    }
+    config.apply_at_exit = if (config.keep == .none)
+        .never
+    else if (assume_yes)
+        .always
+    else if (config.keep == .dir)
+        .never
+    else if (cmd_start >= args.len or std.c.isatty(std.posix.STDIN_FILENO) == 1)
+        .ask
+    else
+        .never;
 
-        if (upper_dir) |dir| {
-            // --upper explicitly provided: persist changes there
+    if (config.apply_at_exit != .never) {
+        config.apply_target = config.cwd;
+    }
+
+    config.verbose = output.isVerbose();
+
+    // Where the changes go.
+    switch (config.keep) {
+        .none => {}, // setupOverlay puts the upper on a tmpfs that dies with the namespace
+        .dir => {
+            const dir = keep_dir.?;
             if (dir.len > 0 and dir[0] != '/') {
                 config.upper_dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, dir }) catch {
                     err("out of memory", .{});
@@ -1467,30 +1517,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             } else {
                 config.upper_dir = dir;
             }
-        } else if (is_interactive) {
-            // Interactive mode without --upper: use temp dir and prompt y/n/d on exit
-            config.upper_dir = sandbox.makeTempDir() catch {
-                err("failed to create temp dir", .{});
-                return 1;
-            };
-            config.enter_target = cwd; // Triggers y/n/d prompt on exit
-        } else {
-            // Non-interactive without --upper: stash under /tmp/poof-<hex>, the same
-            // place an interactive session leaves its changes. Naming the stash after
-            // the command and dropping it in the working directory put it where
-            // `poof stash list` cannot see it (that matches only poof-<16 hex>) and
-            // littered the user's project with a directory called after whatever they
-            // happened to run.
+        },
+        .auto => {
+            // A /tmp/poof-<hex> stash: the same place for a scripted run and a shell, so
+            // `poof stash list` finds it either way. A session that will ask at exit
+            // shows the change list there; one that will not gets the path and the
+            // replay command up front.
             config.upper_dir = sandbox.makeTempDir() catch |e| {
                 err("cannot create stash directory: {}", .{e});
                 return 1;
             };
-
-            const hc = col(Color.bold ++ Color.cyan);
-            const rc = col(Color.reset);
-            info("Changes will be kept in {s}{s}{s}", .{ hc, config.upper_dir.?, rc });
-            info("replay them with: poof apply {s}", .{config.upper_dir.?});
-        }
+            if (config.apply_at_exit == .never) {
+                const hc = col(Color.bold ++ Color.cyan);
+                const rc = col(Color.reset);
+                info("Changes will be kept in {s}{s}{s}", .{ hc, config.upper_dir.?, rc });
+                info("replay them with: poof apply {s}", .{config.upper_dir.?});
+            }
+        },
     }
 
     return run(config);

@@ -50,14 +50,25 @@ pub fn forkChild() ForkResult {
     return .{ .pid = @intCast(@as(isize, @bitCast(r))), .errno = .SUCCESS };
 }
 
-pub const Mode = enum {
-    exec, // tmpfs overlay - ephemeral, changes vanish
-    run, // persistent upper dir, changes saved
-    enter, // interactive - run $SHELL, prompt to apply changes on exit
+// What happens to a session's upper dir once the session ends. This is the only
+// thing that ever distinguished poof's old exec/run/enter "modes": the sandbox is
+// identical in all three, and what differs is whether the changes outlive it.
+pub const Keep = enum {
+    auto, // stash in a /tmp/poof-<hex> dir poof picks
+    dir, // stash in a --keep=<dir> the caller chose
+    none, // --no-keep: the upper lives on a tmpfs that dies with the namespace
+};
+
+// When poof offers to replay a session's changes onto the host.
+pub const ApplyAtExit = enum {
+    never, // leave the stash for `poof apply`
+    ask, // show the change list, then prompt (a terminal is needed)
+    always, // apply without asking (--yes)
 };
 
 pub const Config = struct {
-    mode: Mode,
+    keep: Keep = .auto,
+    apply_at_exit: ApplyAtExit = .never,
     command: []const []const u8,
     upper_dir: ?[]const u8 = null,
     verbose: bool = false,
@@ -67,8 +78,9 @@ pub const Config = struct {
     pids_limit: ?u32 = null, // max processes
     // Timeout
     timeout: ?u32 = null, // seconds
-    // For enter mode: track the target directory to apply changes to
-    enter_target: ?[]const u8 = null,
+    // The directory an exit-time apply writes into. Null means no exit-time apply:
+    // the stash is left for `poof apply <stash>` instead.
+    apply_target: ?[]const u8 = null,
 };
 
 // ============================================================================
@@ -357,12 +369,12 @@ pub fn setupUidGidMappings(uid: u32, gid: u32) !void {
 // ============================================================================
 
 // Cleanup paths (set during setupOverlay, cleaned by parent after child exits)
-pub var cleanup_temp_base: ?[]const u8 = null; // exec/enter mode: temp dir to delete
-pub var cleanup_work_dir: ?[]const u8 = null; // run mode: .work dir to delete
-pub var cleanup_merged_base: ?[]const u8 = null; // run/enter mode: temp dir hosting the merged mount point
+pub var cleanup_temp_base: ?[]const u8 = null; // --no-keep and kept-for-apply sessions: temp dir to delete
+pub var cleanup_work_dir: ?[]const u8 = null; // kept changes: the .work dir beside the stash
+pub var cleanup_merged_base: ?[]const u8 = null; // kept changes: temp dir hosting the merged mount point
 
 pub fn cleanupOverlayDirs() void {
-    // Delete temp base directory (exec and enter modes)
+    // Delete temp base directory (--no-keep, and a session whose changes were applied)
     if (cleanup_temp_base) |path| {
         deleteTree(path);
     }
@@ -869,14 +881,14 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     var merged_dir: []const u8 = undefined;
     var temp_base: []const u8 = undefined;
 
-    if (config.mode == .exec) {
+    if (config.keep == .none) {
         // Use temp dir created by parent before fork (so parent knows path for cleanup)
         temp_base = cleanup_temp_base orelse {
             err("temp dir not set up", .{});
             return .{ .err = .NOENT };
         };
 
-        // Always mount tmpfs for exec mode - content vanishes with namespace
+        // Always mount tmpfs for --no-keep - content vanishes with the namespace
         const temp_base_z = allocator.dupeSentinel(u8, temp_base, 0) catch return .{ .err = .NOMEM };
         switch (mount("tmpfs", temp_base_z.ptr, "tmpfs", 0, null)) {
             .err => |e| {
@@ -891,12 +903,13 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
         work_dir = std.fmt.allocPrint(allocator, "{s}/work", .{temp_base}) catch return .{ .err = .NOMEM };
         merged_dir = std.fmt.allocPrint(allocator, "{s}/merged", .{temp_base}) catch return .{ .err = .NOMEM };
     } else {
-        // Run/enter mode: upper is user-specified and must persist, and work has to sit
-        // on the same filesystem as upper (kernel overlay requirement). The merged mount
+        // Keeping changes: upper is the user's --keep dir or poof's own stash dir, and
+        // work has to sit on the same filesystem as upper (kernel overlay requirement).
+        // The merged mount
         // point must NOT be reachable from inside the sandbox: when anything walks the
         // directory holding it, fuse-overlayfs ends up opening its own mount point and
         // deadlocks. So merged lives under a private tmpfs in /tmp - the fresh /tmp we
-        // mount after chroot/pivot_root hides it, same layout that makes exec mode safe.
+        // mount after chroot/pivot_root hides it, same layout that makes --no-keep safe.
         upper_dir = config.upper_dir.?;
         work_dir = std.fmt.allocPrint(allocator, "{s}.work", .{upper_dir}) catch return .{ .err = .NOMEM };
 
@@ -924,18 +937,19 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     // to the root's: an upper on tmpfs or on a bind-mounted volume works, so only
     // refuse when the upper really is on overlay. fuse-overlayfs (used when there
     // is no real root) still refuses, as before.
-    if (config.mode == .run and use_kernel_overlay) {
+    if (config.keep != .none and use_kernel_overlay) {
         if (fsTypeOf(upper_dir)) |fstype| {
             if (std.mem.eql(u8, fstype, "overlay")) {
-                err("'run' mode needs --upper on a filesystem that is not an overlay", .{});
-                err("{s} is on overlayfs - put it on a tmpfs or a volume (in Docker: --tmpfs /var/tmp)", .{upper_dir});
+                err("the stash cannot live on overlayfs: {s} is on an overlay mount", .{upper_dir});
+                err("move it with --keep=<dir> onto a tmpfs or a volume (in Docker: --tmpfs /var/tmp)", .{});
+                err("or drop the changes entirely: poof --no-keep <program>", .{});
                 return .{ .err = .INVAL };
             }
         }
     }
-    if (config.mode == .run and !use_kernel_overlay and in_overlay) {
-        err("'run' mode not supported in overlay environment (Docker/container)", .{});
-        err("use 'exec' mode instead - changes can't persist to overlay filesystem", .{});
+    if (config.keep != .none and !use_kernel_overlay and in_overlay) {
+        err("keeping changes is not supported in an overlay environment (Docker/container)", .{});
+        err("the stash cannot persist on an overlay filesystem: --keep=<dir> on a tmpfs or a volume, or --no-keep to drop the changes", .{});
         return .{ .err = .INVAL };
     }
 
@@ -980,7 +994,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
     // copy-up's rename gets EXDEV) and shadow the originals with an empty bind.
     var fuse_upper = upper_dir;
     var fuse_work = work_dir;
-    if (!use_kernel_overlay and config.mode != .exec) {
+    if (!use_kernel_overlay and config.keep != .none) {
         const store_dir = std.fmt.allocPrint(allocator, "{s}/store", .{temp_base}) catch return .{ .err = .NOMEM };
         const empty_dir = std.fmt.allocPrint(allocator, "{s}/empty", .{temp_base}) catch return .{ .err = .NOMEM };
         makeDirPath(store_dir) catch |e| {

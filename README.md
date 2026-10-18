@@ -6,22 +6,25 @@
   Ephemeral filesystem isolation
 </pre>
 
-**Run any command in an isolated environment where filesystem changes never touch your host until you say so.** When the command exits, its changes are discarded — or kept in a directory you choose, ready to review and apply. Linux only.
+**Run any command in an isolated environment where filesystem changes never touch your host until you say so.** When the command exits, its changes are kept in a stash you can review and replay — or destroyed with `--no-keep`, or applied as it exits with `--yes`. Linux only.
 
 > **Warning**: This is an **experimental** package. It was written by Claude in a couple of hours and has minimal testing. Use at your own risk.
 
 ```bash
 # Run Claude Code with full permissions in a sandbox
-poof exec claude --dangerously-skip-permissions
+poof claude --dangerously-skip-permissions
 
-# Filesystem changes vanish when done
-poof exec rm -rf ~
+# Its changes are kept: review them, then poof apply
+poof bun install
 
-# Run a command, review its changes, apply or discard
-poof run bun install
+# Nothing survives the command
+poof --no-keep rm -rf ~
 
-# Interactive editing with review before applying
-poof enter
+# Applied as soon as the command exits
+poof --yes make
+
+# A shell, reviewed when you leave it
+poof
 ```
 
 ---
@@ -35,7 +38,7 @@ poof enter
 | **Interactive mode** | Edit files in a sandbox, then review a diff and apply changes |
 | **Namespace isolation** | Mount, PID, UTS and IPC namespaces (network is *not* isolated — see below) |
 | **Resource limits** | Memory limits, process limits, timeouts via cgroups v2 |
-| **Container-aware** | `exec` works inside Docker/Podman; `run`/`enter` need an upper dir that is not itself on an overlay |
+| **Container-aware** | works inside Docker/Podman; keeping the changes needs a stash dir that is not itself on an overlay |
 | **Single binary** | ~350KB static executable with no dependencies |
 
 ---
@@ -91,51 +94,84 @@ sudo cp zig-out/bin/poof /usr/local/bin/
 looks up by itself is pinned to the last configure of `build.zig` and can lag behind
 `HEAD`. Without the flag, `poof --version` labels that value "from last configure".
 
----
+---## What happens to the changes
 
-## Modes
+poof never writes to the real directory unless you tell it to. What the changes do
+when the command exits is a flag, not a mode:
 
-### `exec` — Ephemeral (changes vanish)
+| Flag | What happens to the changes |
+|------|-----------------------------|
+| *(default)* | kept in a stash under `/tmp/poof-<hex>`; `poof stash list` finds it, `poof apply` replays it |
+| `--no-keep` | destroyed with the sandbox; nothing survives |
+| `--keep=<dir>` | kept in `<dir>` instead of a `/tmp` stash, and applied by you, by path |
+| `--yes` | applied to the real directory as the command exits |
 
-All filesystem modifications disappear when the command exits. Perfect for testing, experimentation, or running untrusted code.
+### Keeping them (the default)
 
 ```bash
-# Run Claude with full permissions in a sandbox
-poof exec claude --dangerously-skip-permissions
+# Let Claude edit your code, review the changes before applying them
+poof claude --dangerously-skip-permissions
 
+# See what bun install does before committing to it
+poof bun install
+#   poof: 3 changed files /tmp/poof-4f2a9c1b7d3e8a55
+#     + src/new-file.txt
+#     ~ src/modified.txt
+#     - src/deleted.txt
+#   Changes will be kept in /tmp/poof-4f2a9c1b7d3e8a55
+#   replay them with: poof apply /tmp/poof-4f2a9c1b7d3e8a55
+```
+
+From a terminal the same session shows the list and asks rather than leaving the
+stash: `y` applies, `n` keeps it, `d` shows the full diff first. A command that
+exits non-zero keeps its changes too — a failed build's edits are usually the
+ones worth looking at.
+
+### `--no-keep` — nothing survives
+
+All filesystem modifications disappear when the command exits. Perfect for
+testing, experimentation, or running untrusted code.
+
+```bash
 # Filesystem changes vanish when done
-poof exec rm -rf ~
+poof --no-keep rm -rf ~
 
 # Run untrusted scripts from the internet
-curl -s https://example.com/setup.sh | poof exec bash
+curl -s https://example.com/setup.sh | poof --no-keep bash
 ```
 
-### `run` — Interactive by default
-
-When run interactively (tty), shows the change list and prompts to apply them — just like `enter` but with any command. When run non-interactively (scripts/pipes), the changes are kept in a stash under `/tmp/poof-<hex>` — the same place an interactive session leaves one — which `poof stash list` finds and `poof apply` replays.
+### `--keep=<dir>` — your own stash directory
 
 ```bash
-# Let Claude edit your code, review changes before applying
-poof run claude --dangerously-skip-permissions
-# → Claude makes changes → exit → shows diff → y/n/d prompt
-
-# Review what bun install does before committing
-poof run bun install
-
-# Explicit directory with --upper
-poof run --upper=./my-changes bash
+poof --keep=./my-changes -- make
+poof apply ./my-changes
 ```
 
-### `enter` — Interactive (review & apply)
+The changes go to `<dir>` (relative to the working directory) and nothing is
+applied on its own. This is also how changes are kept inside a container, where
+the root is often an overlay the kernel refuses as an upper dir
+([Persisting changes inside a container](#persisting-changes-inside-a-container)).
 
-Opens your `$SHELL` in an isolated environment. When you exit, poof shows a diff of all changes and prompts you to apply them.
+### `--yes` — apply as the command exits
 
 ```bash
-poof enter
-# Make changes, edit files, install things...
-# When you type 'exit':
-#   → See a diff of all modifications
-#   → Press 'y' to apply, 'n' to discard, 'd' for full diff
+poof --yes make
+```
+
+The change list is printed, then applied, with no prompt. In a script this is the
+difference between “leave it for me to review” and “just do it”.
+
+### A shell, not a command
+
+`poof` with no command opens your `$SHELL` in the sandbox. When you exit it, poof
+shows the change list and asks: `y` to apply, `n` to keep the stash, `d` for the
+full diff. `--no-keep` makes it a disposable shell; `--yes` applies what you did
+when you leave it.
+
+```bash
+poof                  # review the changes on exit
+poof --no-keep        # nothing survives
+poof --yes            # apply what you did, on exit
 ```
 
 This is ideal for:
@@ -161,7 +197,7 @@ poof apply /tmp/poof-4f2a9c1b7d3e8a55
 #   Apply these 12 change(s) to /? [y/N]:
 
 poof apply /tmp/poof-4f2a9c1b7d3e8a55 --yes   # no prompt, for scripts
-poof run --apply=/tmp/poof-4f2a9c1b7d3e8a55 --yes
+poof --apply=/tmp/poof-4f2a9c1b7d3e8a55 --yes
 # a stash that applies in full is removed; a partial failure keeps it for a retry
 ```
 
@@ -187,9 +223,11 @@ applying a stash onto a tree that has moved on.
 | `-v, --verbose` | Show detailed progress and debug info |
 | `-h, --help` | Show help message |
 | `-V, --version` | Show version information |
-| `--upper=<dir>` | Where a session's changes are kept instead of a temp dir (`run` mode); the host is untouched until you `poof apply` it |
+| `--keep=<dir>` | Keep the changes in `<dir>` instead of a `/tmp` stash; nothing is applied on its own |
+| `--no-keep` | Destroy the changes when the command exits |
+| `--yes` | Apply the changes as the command exits; also confirms `poof apply` without prompting |
+| `--upper=<dir>` | Deprecated name for `--keep=<dir>` |
 | `--apply=<stash>` | Replay a saved stash onto the host (no sandbox started) |
-| `--yes` | Confirm `--apply` without prompting |
 | `--timeout=<secs>` | Kill process after N seconds (exit code 124) |
 | `--memory=<size>` | Memory limit, e.g. `100M`, `1G` |
 | `--pids=<max>` | Max processes (fork bomb protection, minimum 2) |
@@ -202,16 +240,16 @@ boot the sandbox is rejected up front instead of failing inside it.
 
 ```bash
 # Limit memory to 512MB
-poof exec --memory=512M bun install
+poof --memory=512M bun install
 
 # Protect against fork bombs
-poof exec --pids=50 ./untrusted-script.sh
+poof --pids=50 ./untrusted-script.sh
 
 # Kill after 30 seconds
-poof exec --timeout=30 make test
+poof --timeout=30 make test
 
 # Combine limits
-poof exec --memory=1G --pids=100 --timeout=60 cargo build
+poof --memory=1G --pids=100 --timeout=60 cargo build
 ```
 
 ---
@@ -243,9 +281,9 @@ poof leans on four Linux kernel features:
 | **UTS** | Isolated hostname |
 | **IPC** | Isolated System V IPC |
 
-- `exec` mode: the upper layer is a tmpfs that is destroyed on exit
-- `run` mode: the upper layer is a directory you chose, so the changes outlive the session as a stash — the host tree is still untouched
-- `enter` mode: the upper layer is a temp directory, replayed onto the host if you confirm
+- `--no-keep`: the upper layer is a tmpfs, destroyed together with the namespace
+- *(default)*: the upper layer is a stash under `/tmp`, so the changes outlive the session as a stash — the host tree is still untouched
+- `--keep=<dir>`: the upper layer is a directory you chose, replayed by path with `poof apply`
 
 ### The lower layer is the live root
 
@@ -290,13 +328,12 @@ volume, a `--tmpfs` — poof is not overlaying it: run poof where that filesyste
 the root (inside a container, that is what `./scripts/test-docker.sh` arranges by
 moving the container onto a plain tmpfs root).
 
-poof says so up front rather than letting you find out from a lost write. Before an
-`exec`/`run`/`enter` session starts it looks up the working directory (for `enter`, the
-target directory) in `/proc/mounts`, and warns if the mount covering it is not the root
-mount:
+poof says so up front rather than letting you find out from a lost write. Before a
+session starts it looks up the working directory in `/proc/mounts` and warns if the
+mount covering it is not the root mount:
 
 ```console
-$ cd /dev/shm/some-workdir && poof exec -- make
+$ cd /dev/shm/some-workdir && poof -- make
 ⚠ /dev/shm/some-workdir sits on the tmpfs mount at /dev/shm, not the root filesystem
 ● poof overlays the root mount only: as root the mounted tree is not visible inside the sandbox, and writes there land in the upper dir instead
 ```
@@ -320,11 +357,11 @@ sudo pacman -S fuse-overlayfs      # Arch
 sudo sysctl kernel.unprivileged_userns_clone=1
 
 # Run poof as a regular user
-poof exec echo "No root required!"
+poof --no-keep echo "No root required!"
 ```
 
-| Mode | Root | Non-root (with fuse-overlayfs) |
-|------|------|--------------------------------|
+| Mechanism | Root | Non-root (with fuse-overlayfs) |
+|-----------|------|--------------------------------|
 | Kernel overlayfs | Yes | No |
 | User namespaces | No | Yes |
 | `/proc` mount | Yes | No (limited) |
@@ -337,7 +374,7 @@ poof exec echo "No root required!"
 
 ```bash
 docker run -it --privileged ubuntu bash
-poof exec echo "Works!"
+poof --no-keep echo "Works!"
 ```
 
 ### Minimal Permissions (recommended)
@@ -348,7 +385,7 @@ docker run -it \
   --device /dev/fuse \
   --security-opt seccomp=unconfined \
   my-image-with-fuse-overlayfs bash
-poof exec echo "Works without CAP_SYS_ADMIN!"
+poof --no-keep echo "Works without CAP_SYS_ADMIN!"
 ```
 
 poof auto-detects when CAP_SYS_ADMIN is missing and falls back to user namespaces + fuse-overlayfs.
@@ -358,27 +395,27 @@ poof auto-detects when CAP_SYS_ADMIN is missing and falls back to user namespace
 ```bash
 # Uses faster kernel overlayfs, no fuse-overlayfs needed
 docker run -it --cap-add=SYS_ADMIN --security-opt seccomp=unconfined ubuntu bash
-poof exec echo "Works with kernel overlay!"
+poof --no-keep echo "Works with kernel overlay!"
 ```
 
-### Persisting changes inside a container (`run` / `enter`)
+### Persisting changes inside a container
 
-`exec` works anywhere. `run` and `enter` additionally need somewhere to keep the
-changes, and the kernel refuses an upper dir that is itself on an overlay - which
-a container root normally is. Put the upper dir on a filesystem that is not an
-overlay:
+`--no-keep` works anywhere. Keeping changes needs somewhere to put them, and the
+kernel refuses an upper dir that is itself on an overlay - which a container root
+normally is. Put the stash on a filesystem that is not an overlay:
 
 ```bash
 docker run -it --privileged --tmpfs /var/tmp ubuntu bash
-poof run --upper=/var/tmp/changes -- make   # review and apply afterwards
+poof --keep=/var/tmp/changes -- make   # review and apply afterwards
 poof apply /var/tmp/changes
 ```
 
 poof says so rather than failing obscurely:
 
 ```
-✗ error: 'run' mode needs --upper on a filesystem that is not an overlay
-✗ error: /var/tmp/up is on overlayfs - put it on a tmpfs or a volume (in Docker: --tmpfs /var/tmp)
+✗ error: the stash cannot live on overlayfs: /var/tmp/changes is on an overlay mount
+✗ error: move it with --keep=<dir> onto a tmpfs or a volume (in Docker: --tmpfs /var/tmp)
+✗ error: or drop the changes entirely: poof --no-keep <program>
 ```
 
 Note that a `--tmpfs` mount is only good for the upper dir: a *target* directory on a
@@ -412,7 +449,7 @@ container onto a plain tmpfs root so the whole tree can be overlaid.
 | Variable | Effect |
 |----------|--------|
 | `NO_COLOR` | Disable colored output |
-| `SHELL` | Shell used by `enter` mode (default: `/bin/sh`) |
+| `SHELL` | Shell opened when poof is given no command (default: `/bin/sh`) |
 | `IS_SANDBOX` | Set to `1` inside the sandbox (useful for scripts to detect sandbox) |
 
 ---
@@ -477,9 +514,9 @@ poof is designed to make **filesystem changes reversible**, not to provide full 
 
 - **Linux only** — Uses Linux-specific kernel features (namespaces, overlayfs)
 - **Overlay depth** — Maximum 2 levels of overlay stacking (kernel limit)
-- **`run` mode in containers** — the kernel refuses an upper dir that sits on an
-  overlay mount, and a container root usually is one; point `--upper` at a tmpfs
-  or a volume, or use `exec` (see [Docker / Container Support](#docker--container-support))
+- **Keeping changes in containers** — the kernel refuses an upper dir that sits on
+  an overlay mount, and a container root usually is one; point `--keep` at a tmpfs
+  or a volume, or use `--no-keep` (see [Docker / Container Support](#docker--container-support))
 - **Special filesystems** — `/proc`, `/sys`, `/dev` are remounted fresh
 - **Nested mounts** — the lower layer is the root mount, so filesystems mounted
   under it sit outside the overlay; poof warns when the working directory is on one
@@ -497,7 +534,7 @@ MIT
 
 ### Process Lifecycle
 
-When you run `poof exec <command>`:
+When you run `poof --no-keep <command>`:
 
 ```
 1. Parent process
@@ -558,9 +595,9 @@ Deleting a file:
 the live root](#the-lower-layer-is-the-live-root)). A stash is therefore only the
 upper dir: the deltas, mirroring absolute paths from `/`.
 
-In `exec` mode, upperdir is on a tmpfs — when the namespace exits, the tmpfs is destroyed and all changes vanish.
+With `--no-keep`, upperdir is on a tmpfs — when the namespace exits, the tmpfs is destroyed and all changes vanish.
 
-In `run`/`enter` mode upperdir is the user's own directory and workdir sits beside it (`<upper>.work`, required to be on the same filesystem as upperdir), but the merged mount point is placed inside a private tmpfs under `/tmp` instead. The sandbox never sees the path the overlay is mounted at — that keeps fuse-overlayfs from resolving its own mount point when a sandboxed process walks the tree around it.
+When the changes are kept, upperdir is poof's own `/tmp/poof-<hex>` stash or the `--keep` directory, and workdir sits beside it (`<upper>.work`, required to be on the same filesystem as upperdir), but the merged mount point is placed inside a private tmpfs under `/tmp` instead. The sandbox never sees the path the overlay is mounted at — that keeps fuse-overlayfs from resolving its own mount point when a sandboxed process walks the tree around it.
 
 ### Namespace Isolation
 
@@ -625,9 +662,9 @@ allows this, poof fails with a clear error instead of running unlimited.
 - Uses `chroot` (pivot_root requires real root)
 - UID 0 inside maps to your real UID outside
 
-### Enter Mode Change Detection
+### Change Detection
 
-When you exit an `enter` session, poof scans the upperdir:
+When a session ends with its changes still unapplied, poof scans the upperdir:
 
 ```
 For each file in upperdir:
@@ -649,87 +686,72 @@ otherwise from the `.wh..wh..opq` file fuse-overlayfs writes.
 
 ## Command Reference
 
-### `poof exec`
+### `poof`
 
 ```
-poof exec — Run command in ephemeral sandbox (changes vanish)
+poof — Run a command; its filesystem changes stay out of the host
 
 USAGE
-  poof exec [options] [--] <program> [args...]
+  poof [options] [--] <program> [args...]
+  poof [options]                     interactive shell
+
+CHANGES
+  (default)      keep them in a /tmp stash, replay with poof apply
+  --no-keep      destroy them when the command exits
+  --keep=<dir>   keep them in <dir> instead of a /tmp stash
+  --yes          apply them to the real directory as the command exits
 
 EXAMPLES
-  $ poof exec claude --dangerously-skip-permissions
-  $ poof exec rm -rf ~                 # Safe! Nothing happens
-  $ poof exec bash                    # Disposable shell
-  $ poof exec --timeout=60 ./build.sh  # Kill if > 60s
+  $ poof bun install              # kept; replay with poof apply
+  $ poof --yes make               # applied as soon as it exits
+  $ poof --no-keep rm -rf ~       # Safe! Nothing happens
+  $ poof                          # a shell, reviewed on exit
 
 OPTIONS
-  --timeout=<secs>    Kill after N seconds (exit code 124)
-  --memory=<size>     Memory limit (e.g. 100M, 1G)
-  --pids=<max>        Max processes (fork bomb protection)
-  -v, --verbose       Show detailed progress
+  -v, --verbose               Show detailed progress
+  -h, --help                  Show this help
+  -V, --version               Show version
+  --timeout=<secs>            Kill after N seconds (exit code 124)
+  --memory=<bytes>            Memory limit (e.g. 100M, 1G)
+  --pids=<max>                Max processes (fork bomb protection)
+  --upper=<dir>               Deprecated: use --keep=<dir>
 ```
 
-### `poof run`
+From a terminal, the exit looks like this:
 
 ```
-poof run — Run command, review changes, apply or discard
-
-USAGE
-  poof run [options] [--] <program> [args...]
-
-EXAMPLES
-  $ poof run claude --dangerously-skip-permissions
-  $ poof run bun install              # Review changes first
-  $ poof run --upper=./changes bash   # keep the changes there
-
-When the command exits, you'll see:
-  ● 3 changed files /tmp/poof-xxx
+  poof: 3 changed files /tmp/poof-4f2a9c1b7d3e8a55
     + src/new-file.txt
     ~ src/modified.txt
     - src/deleted.txt
 
-  Apply changes? [y/N/d]
-    y — Apply all changes to host
-    n — Discard (keep in temp dir)
-    d — Show full diff first
+  Apply these changes to /home/me/proj? [y/N/d(iff)]:
+    y — apply them to the real directory
+    n — leave them in the stash; poof apply <stash> replays them later
+    d — show the full diff first
+```
 
 If the session ends abnormally (`--timeout`, or SIGINT/SIGTERM/SIGHUP to poof), the
-changes are never destroyed silently: they are kept in the temp dir and poof prints
+changes are never destroyed silently: they are kept in the stash and poof prints
 `Stashed changes in <dir>`. That stash is applied later with `poof apply <dir>`
 (see below); `poof stash list` finds them.
 
-OPTIONS
-  --upper=<dir>       Keep changes in <dir>, skip the prompt
-  --timeout=<secs>    Kill after N seconds
-  --memory=<size>     Memory limit (e.g. 100M, 1G)
-  --pids=<max>        Max processes
-  -v, --verbose       Show detailed progress
-```
+### Deprecated: `exec`, `run`, `enter`
 
-### `poof enter`
+The three mode words still work, and each prints a one-line warning; they are kept
+so existing scripts keep running.
 
-```
-poof enter — Interactive shell with review on exit
+| Then | Now |
+|------|-----|
+| `poof exec <program>` | `poof --no-keep <program>` |
+| `poof run <program>` | `poof <program>` |
+| `poof run --upper=<dir> <program>` | `poof --keep=<dir> <program>` |
+| `poof enter` | `poof` |
+| `poof enter /etc` | `cd /etc && poof` |
 
-USAGE
-  poof enter [options] [directory]
-
-Opens your $SHELL in an isolated environment. When you exit:
-  1. See a summary of all changes
-  2. Press 'y' to apply, 'n' to discard, 'd' for full diff
-
-EXAMPLES
-  $ poof enter                        # Start isolated shell
-  $ poof enter -v                     # With verbose output
-  $ poof enter /etc                   # Sandbox /etc, shell starts there
-
-OPTIONS
-  -v, --verbose       Show detailed progress
-  --timeout=<secs>    Kill after N seconds
-  --memory=<size>     Memory limit (e.g. 100M, 1G)
-  --pids=<max>        Max processes
-```
+`poof enter <dir>` has no flag equivalent: the plain form reads its first
+positional as the program to run, so to sandbox a different directory, change
+into it first.
 
 ### `poof apply`
 
@@ -738,7 +760,7 @@ poof apply — Replay a saved upper dir (stash) onto the host
 
 USAGE
   poof apply [options] <stash>
-  poof run --apply=<stash>     the same, script-friendly
+  poof --apply=<stash>         the same, script-friendly
 
 EXAMPLES
   $ poof stash list                  # find stashes
@@ -760,7 +782,7 @@ OPTIONS
 A stash that applies in full is removed; one that hits any failure is kept so the
 failures can be fixed and the same stash applied again. A stash that is the current
 directory is applied but left in place rather than deleted under you.
-A stash you chose with `--upper=<dir>` is applied by path — only poof's own
+A stash you chose with `--keep=<dir>` is applied by path — only poof's own
 `/tmp/poof-<hex>` upper dirs are listed by `poof stash list`.
 
 ### `poof stash list`
@@ -783,25 +805,30 @@ Stashes with no changes are skipped. poof never deletes a stash on its own.
   Ephemeral filesystem isolation
 
 USAGE
-  poof <command> [options] [--] <program> [args...]
+  poof [options] [--] <program> [args...]
+  poof [options]                     interactive shell
+
+CHANGES
+  poof never writes to the real directory unless you say so. These flags
+  decide what happens to the changes a command makes:
+    (default)      keep them in a /tmp stash, replay with poof apply
+    --no-keep      destroy them when the command exits
+    --keep=<dir>   keep them in <dir> instead of a /tmp stash
+    --yes          apply them to the real directory as the command exits
 
 COMMANDS
-  exec  <program>             Run in ephemeral mode (changes vanish)
-  run   <program>             Review & apply on exit (--upper=<dir> keeps a stash)
-  enter                       Interactive $SHELL (review & apply on exit)
-  apply <stash>               Replay a saved upper dir onto the host
+  apply <stash>               Replay a saved stash onto the host
   stash list                  List stashes left in /tmp
+  exec / run / enter          Deprecated mode words, still accepted
 
 OPTIONS
   -v, --verbose               Show detailed progress
   -h, --help                  Show this help
   -V, --version               Show version
-  --upper=<dir>               Directory for changes (run mode)
-  --apply=<stash>             Replay a saved stash (no sandbox)
-  --yes                       Confirm --apply without prompting
-  --timeout=<secs>            Kill after N seconds
+  --timeout=<secs>            Kill after N seconds (exit code 124)
   --memory=<bytes>            Memory limit (e.g. 100M, 1G)
   --pids=<max>                Max processes (fork bomb protection)
+  --upper=<dir>               Deprecated: use --keep=<dir>
 
 ISOLATION
   • Mount namespace with overlay filesystem
@@ -810,9 +837,13 @@ ISOLATION
   • IPC namespace (isolated System V IPC)
 
 EXAMPLES
-  $ poof exec claude --dangerously-skip-permissions
-  $ poof exec rm -rf ~                # Safe! Nothing happens
-  $ poof run bun install              # Review changes first
+  $ poof bun install              # kept; replay with poof apply
+  $ poof --yes make               # applied as soon as it exits
+  $ poof --no-keep rm -rf ~       # Safe! Nothing happens
+  $ poof                          # a shell, reviewed on exit
+
+NOTE  Works inside Docker/Podman (1 nesting level, kernel limit)
+ENV   IS_SANDBOX=1 is set inside the sandbox
 ```
 
 ---
