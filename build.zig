@@ -22,6 +22,12 @@ pub fn build(b: *std.Build) void {
         };
     };
 
+    // diffz: the diff-match-patch text diff behind poof's own diff view.
+    const diffz = b.dependency("diffz", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("diffz");
+
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_commit", git_commit);
@@ -38,8 +44,24 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addOptions("build_options", options);
+    exe.root_module.addImport("diffz", diffz);
 
     b.installArtifact(exe);
+
+    // Unit tests for the diff renderer: pure logic over strings, no sandbox and no
+    // terminal, so they run anywhere. The end-to-end suite lives in tests/.
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    tests.root_module.addImport("diffz", diffz);
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
 
     const run_step = b.step("run", "Run poof");
     const run_cmd = b.addRunArtifact(exe);

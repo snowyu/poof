@@ -123,8 +123,8 @@ poof bun install
 ```
 
 From a terminal the same session shows the list and asks rather than leaving the
-stash: `y` applies, `n` keeps it, `d` shows the full diff first. A command that
-exits non-zero keeps its changes too — a failed build's edits are usually the
+stash: `y` applies, `n` keeps it, `d` shows the diff first. A command that exits
+non-zero keeps its changes too — a failed build's edits are usually the
 ones worth looking at.
 
 ### `--no-keep` — nothing survives
@@ -165,8 +165,8 @@ difference between “leave it for me to review” and “just do it”.
 
 `poof` with no command opens your `$SHELL` in the sandbox. When you exit it, poof
 shows the change list and asks: `y` to apply, `n` to keep the stash, `d` for the
-full diff. `--no-keep` makes it a disposable shell; `--yes` applies what you did
-when you leave it.
+diff. `--no-keep` makes it a disposable shell; `--yes` applies what you did when
+you leave it.
 
 ```bash
 poof                  # review the changes on exit
@@ -226,7 +226,6 @@ applying a stash onto a tree that has moved on.
 | `--keep=<dir>` | Keep the changes in `<dir>` instead of a `/tmp` stash; nothing is applied on its own |
 | `--no-keep` | Destroy the changes when the command exits |
 | `--yes` | Apply the changes as the command exits; also confirms `poof apply` without prompting |
-| `--upper=<dir>` | Deprecated name for `--keep=<dir>` |
 | `--apply=<stash>` | Replay a saved stash onto the host (no sandbox started) |
 | `--timeout=<secs>` | Kill process after N seconds (exit code 124) |
 | `--memory=<size>` | Memory limit, e.g. `100M`, `1G` |
@@ -485,14 +484,14 @@ nodes (CAP_MKNOD), and cgroup delegation. Run those in a container:
 ```bash
 ./scripts/test-docker.sh                        # docker
 POOF_CONTAINER_RUNTIME=podman ./scripts/test-docker.sh
-POOF_TEST_APT=git ./scripts/test-docker.sh      # also cover the `d` diff view
+POOF_TEST_APT=git ./scripts/test-docker.sh      # also cover the git-repo cases
 ```
 
 The script starts a privileged container, moves it onto a plain tmpfs root (poof
 cannot overlay a container's overlayfs root), turns on cgroup delegation, then
 builds with the host's zig and bun bind mounted and runs the whole suite as root.
 Cases whose prerequisites are missing - no root, no CAP_MKNOD, no cgroup
-delegation, no git for the diff view - skip instead of failing.
+delegation, no git - skip instead of failing.
 
 ---
 
@@ -674,6 +673,17 @@ For each file in upperdir:
   - Empty directory → "added directory" (green +)
 ```
 
+### The diff view
+
+`d` at the prompt prints a unified diff of the change list above it, and of nothing
+else: the same files poof would apply, each with its hunks and a few lines of
+context. It is poof's own diff - no git, and no pair of directory trees to compare -
+so an unrelated dirty working tree, a repository's own uncommitted work included,
+stays out of it. Files with no text to compare say what they are instead: binary,
+too large to diff, a symlink shown as its target, a directory the sandbox created.
+A very large change set is cut short after a few thousand lines, with the complete
+list printed above it and a note saying how much was left out.
+
 If you confirm with 'y', poof replays the upperdir onto the target instead of copying it:
 whiteouts become real deletions, missing directories are created, symlinks are
 recreated as symlinks, and regular files are copied with their mode. Overlay
@@ -700,6 +710,7 @@ CHANGES
   --no-keep      destroy them when the command exits
   --keep=<dir>   keep them in <dir> instead of a /tmp stash
   --yes          apply them to the real directory as the command exits
+  Either way the prompt accepts d for a diff of exactly those changes.
 
 EXAMPLES
   $ poof bun install              # kept; replay with poof apply
@@ -714,7 +725,6 @@ OPTIONS
   --timeout=<secs>            Kill after N seconds (exit code 124)
   --memory=<bytes>            Memory limit (e.g. 100M, 1G)
   --pids=<max>                Max processes (fork bomb protection)
-  --upper=<dir>               Deprecated: use --keep=<dir>
 ```
 
 From a terminal, the exit looks like this:
@@ -728,30 +738,13 @@ From a terminal, the exit looks like this:
   Apply these changes to /home/me/proj? [y/N/d(iff)]:
     y — apply them to the real directory
     n — leave them in the stash; poof apply <stash> replays them later
-    d — show the full diff first
+    d — show the diff of exactly these changes first
 ```
 
 If the session ends abnormally (`--timeout`, or SIGINT/SIGTERM/SIGHUP to poof), the
 changes are never destroyed silently: they are kept in the stash and poof prints
 `Stashed changes in <dir>`. That stash is applied later with `poof apply <dir>`
 (see below); `poof stash list` finds them.
-
-### Deprecated: `exec`, `run`, `enter`
-
-The three mode words still work, and each prints a one-line warning; they are kept
-so existing scripts keep running.
-
-| Then | Now |
-|------|-----|
-| `poof exec <program>` | `poof --no-keep <program>` |
-| `poof run <program>` | `poof <program>` |
-| `poof run --upper=<dir> <program>` | `poof --keep=<dir> <program>` |
-| `poof enter` | `poof` |
-| `poof enter /etc` | `cd /etc && poof` |
-
-`poof enter <dir>` has no flag equivalent: the plain form reads its first
-positional as the program to run, so to sandbox a different directory, change
-into it first.
 
 ### `poof apply`
 
@@ -818,11 +811,11 @@ CHANGES
     --no-keep      destroy them when the command exits
     --keep=<dir>   keep them in <dir> instead of a /tmp stash
     --yes          apply them to the real directory as the command exits
+  Either way the prompt accepts d for a diff of exactly those changes.
 
 COMMANDS
-  apply <stash>               Replay a saved stash onto the host
-  stash list                  List stashes left in /tmp
-  exec / run / enter          Deprecated mode words, still accepted
+  apply <stash>              Replay a saved stash onto the host
+  stash list                 List stashes left in /tmp
 
 OPTIONS
   -v, --verbose               Show detailed progress
@@ -831,7 +824,6 @@ OPTIONS
   --timeout=<secs>            Kill after N seconds (exit code 124)
   --memory=<bytes>            Memory limit (e.g. 100M, 1G)
   --pids=<max>                Max processes (fork bomb protection)
-  --upper=<dir>               Deprecated: use --keep=<dir>
 
 ISOLATION
   • Mount namespace with overlay filesystem

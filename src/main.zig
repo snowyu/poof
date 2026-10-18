@@ -7,6 +7,7 @@ const options = @import("build_options");
 
 const output = @import("output.zig");
 const sandbox = @import("sandbox.zig");
+const diffview = @import("diffview.zig");
 
 // Version info (set at build time)
 const version = options.version;
@@ -18,10 +19,6 @@ const allocator = sandbox.allocator;
 const Config = sandbox.Config;
 const Keep = sandbox.Keep;
 const ApplyAtExit = sandbox.ApplyAtExit;
-
-// The old mode words, still accepted. They named a disposition of the changes, not a
-// kind of sandbox - the sandbox is the same in every case - so they are now flags.
-const Alias = enum { exec, run, enter };
 
 const step = output.step;
 const vstep = output.vstep;
@@ -276,24 +273,10 @@ fn isWhiteout(name: []const u8, entry_kind: sandbox.DirEntryKind, stat: ?FileInf
 // Commands that do not start a sandbox: they work on what a sandbox left behind.
 const Subcommand = enum { apply, stash };
 
-const ChangeType = enum { added, edited, deleted };
-
-const Change = struct {
-    path: []const u8,
-    change_type: ChangeType,
-};
-
-const ChangeList = struct {
-    items: []Change,
-    len: usize,
-
-    fn append(self: *ChangeList, change: Change) void {
-        if (self.len < self.items.len) {
-            self.items[self.len] = change;
-            self.len += 1;
-        }
-    }
-};
+// The change list lives in diffview, which prints it and diffs it.
+const ChangeType = diffview.ChangeType;
+const Change = diffview.Change;
+const ChangeList = diffview.ChangeList;
 
 // True when the directory holds at least one entry that is not overlay
 // bookkeeping.
@@ -455,51 +438,43 @@ fn handleExitApply(config: Config) void {
         return;
     }
 
-    // Prompt user
-    const c1 = col(Color.bold_yellow);
-    const c2 = col(Color.reset);
-    print("{s}Apply these changes to {s}?{s} [y/N/d(iff)]: ", .{ c1, target_dir, c2 });
-
-    // Read user input
-    var input_buf: [16]u8 = undefined;
-    const n = readStdin(&input_buf) orelse {
-        print("\n", .{});
-        keepChanges(upper_dir);
-        return;
-    };
-    const input = input_buf[0..n];
-
-    const trimmed = std.mem.trim(u8, input, " \t\r\n");
-
-    if (std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y") or std.mem.eql(u8, trimmed, "yes")) {
-        // Apply changes using rsync or cp
+    const question = std.fmt.allocPrint(allocator, "Apply these changes to {s}?", .{target_dir}) catch
+        "Apply these changes?";
+    if (askApply(question, changes.items[0..changes.len], changes_path, target_dir)) {
         applyChanges(changes_path, target_dir);
-    } else if (std.mem.eql(u8, trimmed, "d") or std.mem.eql(u8, trimmed, "D") or std.mem.eql(u8, trimmed, "diff")) {
-        // Show full diff (--no-pager to avoid "terminal not fully functional" issues)
-        const full_diff_argv = [_][]const u8{ "git", "--no-pager", "diff", "--no-index", target_dir, changes_path };
-        const diff_rc = sandbox.runProcess(&full_diff_argv);
-        if (diff_rc == null or diff_rc.? == 127) {
-            // execvp failed in the child, which exits 127 silently: say why the
-            // diff is missing instead of leaving the prompt with no output.
-            warn("cannot show diff: git is not installed", .{});
-        }
-
-        // Prompt again
-        print("\n{s}Apply these changes?{s} [y/N]: ", .{ c1, c2 });
-        var input_buf2: [16]u8 = undefined;
-        const n2 = readStdin(&input_buf2) orelse {
-            print("\n", .{});
-            keepChanges(upper_dir);
-            return;
-        };
-        const trimmed2 = std.mem.trim(u8, input_buf2[0..n2], " \t\r\n");
-        if (std.mem.eql(u8, trimmed2, "y") or std.mem.eql(u8, trimmed2, "Y")) {
-            applyChanges(changes_path, target_dir);
-        } else {
-            keepChanges(upper_dir);
-        }
     } else {
         keepChanges(upper_dir);
+    }
+}
+
+// Ask what to do with a change list; `d` shows a unified diff and asks again.
+//
+// The diff is poof's own, and its scope is the change list: what `poof apply`
+// would write, nothing else. It used to shell out to `git diff --no-index
+// <target> <stash>`, which compared whole directory trees - so it reported every
+// difference between them, including a repository's own uncommitted work, and it
+// needed git installed to explain a change poof made itself.
+fn askApply(question: []const u8, changes: []const Change, changes_root: []const u8, target_root: []const u8) bool {
+    const c1 = col(Color.bold_yellow);
+    const c2 = col(Color.reset);
+    print("{s}{s}{s} [y/N/d(iff)]: ", .{ c1, question, c2 });
+
+    while (true) {
+        var input_buf: [16]u8 = undefined;
+        const n = readStdin(&input_buf) orelse {
+            print("\n", .{});
+            return false;
+        };
+        const trimmed = std.mem.trim(u8, input_buf[0..n], " \t\r\n");
+
+        if (std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y") or std.mem.eql(u8, trimmed, "yes")) return true;
+
+        if (std.mem.eql(u8, trimmed, "d") or std.mem.eql(u8, trimmed, "D") or std.mem.eql(u8, trimmed, "diff")) {
+            diffview.showChanges(changes, changes_root, target_root, .{});
+            print("\n{s}{s}{s} [y/N]: ", .{ c1, question, c2 });
+            continue;
+        }
+        return false;
     }
 }
 
@@ -797,16 +772,10 @@ fn applyStash(input: []const u8, cwd: []const u8, assume_yes: bool) u8 {
             err("refusing to apply {d} change(s) to / without a terminal; pass --yes to confirm", .{changes.len});
             return 1;
         }
-        const c1 = col(Color.bold_yellow);
-        const c2 = col(Color.reset);
-        print("{s}Apply these {d} change(s) to /?{s} [y/N]: ", .{ c1, changes.len, c2 });
-        var input_buf: [16]u8 = undefined;
-        const n = readStdin(&input_buf) orelse {
+        const question = std.fmt.allocPrint(allocator, "Apply these {d} change(s) to /?", .{changes.len}) catch
+            "Apply these changes?";
+        if (!askApply(question, changes.items[0..changes.len], stash, "/")) {
             print("\n", .{});
-            return 130;
-        };
-        const trimmed = std.mem.trim(u8, input_buf[0..n], " \t\r\n");
-        if (!(std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y") or std.mem.eql(u8, trimmed, "yes"))) {
             info("not applied; stash kept in {s}", .{stash});
             return 0;
         }
@@ -871,7 +840,7 @@ fn stashAge(path_z: [*:0]const u8) ?i64 {
 
 // poof names its temp upper dirs /tmp/poof-<16 hex>. Matching that exactly keeps
 // unrelated /tmp/poof-* directories out of the listing; a stash the user chose
-// with --upper=<dir> is applied by path, it is never listed.
+// with --keep=<dir> is applied by path, it is never listed.
 fn isStashName(name: []const u8) bool {
     if (!std.mem.startsWith(u8, name, "poof-")) return false;
     const suffix = name[5..];
@@ -928,7 +897,7 @@ fn listStashes() u8 {
     if (found == 0) {
         info("no stashes with changes in /tmp", .{});
         output.routeToStdout(false);
-        log("a --upper=<dir> stash is applied by path: poof apply <dir>", .{});
+        log("a --keep=<dir> stash is applied by path: poof apply <dir>", .{});
         return 0;
     }
     print("\n", .{});
@@ -1138,85 +1107,6 @@ fn printApplyHelp() void {
     print("  {s}-h, --help{s}                 Show this help\n", .{ C, R });
 }
 
-fn printModeHelp(mode: Alias) void {
-    const C = col(Color.cyan);
-    const B = col(Color.bold);
-    const BB = col(Color.bold_blue);
-    const G = col(Color.green);
-    const Y = col(Color.yellow);
-    const RE = col(Color.red);
-    const D = col(Color.dim);
-    const R = col(Color.reset);
-
-    // The mode words stay so muscle memory and existing scripts keep working; what
-    // the changes do is spelled with flags now, so say so before the old help.
-    const replacement = switch (mode) {
-        .exec => "poof --no-keep <program>",
-        .run => "poof <program>",
-        .enter => "poof, with no command",
-    };
-    print("\n  {s}deprecated{s} — the same thing with flags: {s}{s}{s}\n", .{ Y, R, C, replacement, R });
-
-    switch (mode) {
-        .exec => {
-            print("\n{s}poof exec{s} — Run command in ephemeral sandbox {s}(changes vanish){s}\n", .{ C, R, D, R });
-            print("\n{s}USAGE{s}\n", .{ B, R });
-            print("  poof exec [options] [--] {s}<program>{s} [args...]\n", .{ Y, R });
-            print("\n{s}EXAMPLES{s}\n", .{ B, R });
-            print("  {s}${s} poof exec claude --dangerously-skip-permissions\n", .{ D, R });
-            print("  {s}${s} poof exec rm -rf ~                 {s}# Safe! Nothing happens{s}\n", .{ D, R, D, R });
-            print("  {s}${s} poof exec bash                    {s}# Disposable shell{s}\n", .{ D, R, D, R });
-            print("  {s}${s} poof exec --timeout=60 ./build.sh  {s}# Kill if > 60s{s}\n", .{ D, R, D, R });
-            print("\n{s}OPTIONS{s}\n", .{ B, R });
-            print("  {s}--timeout=<secs>{s}    Kill after N seconds (exit code 124)\n", .{ G, R });
-            print("  {s}--memory=<size>{s}     Memory limit (e.g. 100M, 1G)\n", .{ G, R });
-            print("  {s}--pids=<max>{s}        Max processes (fork bomb protection)\n", .{ G, R });
-            print("  {s}-v, --verbose{s}       Show detailed progress\n\n", .{ G, R });
-        },
-        .run => {
-            print("\n{s}poof run{s} — Run command, review changes, apply or discard\n", .{ C, R });
-            print("\n{s}USAGE{s}\n", .{ B, R });
-            print("  poof run [options] [--] {s}<program>{s} [args...]\n", .{ Y, R });
-            print("\n{s}EXAMPLES{s}\n", .{ B, R });
-            print("  {s}${s} poof run claude --dangerously-skip-permissions\n", .{ D, R });
-            print("  {s}${s} poof run bun install              {s}# Review changes first{s}\n", .{ D, R, D, R });
-            print("  {s}${s} poof run --upper=./changes bash   {s}# keep the changes there{s}\n", .{ D, R, D, R });
-            print("\n{s}When the command exits, you'll see:{s}\n", .{ D, R });
-            print("  {s}poof{s}: {s}3 changed files{s} /tmp/poof-xxx\n", .{ BB, R, B, R });
-            print("    {s}+{s} src/new-file.txt\n", .{ G, R });
-            print("    {s}~{s} src/modified.txt\n", .{ Y, R });
-            print("    {s}-{s} src/deleted.txt\n", .{ RE, R });
-            print("\n  {s}Apply changes?{s} [y/N/d]\n", .{ Y, R });
-            print("    {s}y{s} — Apply all changes to host\n", .{ G, R });
-            print("    {s}n{s} — Discard (keep in temp dir)\n", .{ G, R });
-            print("    {s}d{s} — Show full diff first\n", .{ G, R });
-            print("\n{s}OPTIONS{s}\n", .{ B, R });
-            print("  {s}--keep=<dir>{s}        Keep changes in <dir>, skip the prompt\n", .{ G, R });
-            print("  {s}--yes{s}             Apply them to the host as the command exits\n", .{ G, R });
-            print("  {s}--timeout=<secs>{s}    Kill after N seconds\n", .{ G, R });
-            print("  {s}--memory=<size>{s}     Memory limit (e.g. 100M, 1G)\n", .{ G, R });
-            print("  {s}--pids=<max>{s}        Max processes\n", .{ G, R });
-            print("  {s}-v, --verbose{s}       Show detailed progress\n\n", .{ G, R });
-        },
-        .enter => {
-            print("\n{s}poof enter{s} — Interactive sandbox with $SHELL\n", .{ C, R });
-            print("\n{s}USAGE{s}\n", .{ B, R });
-            print("  poof enter [options] [directory]\n", .{});
-            print("\n{s}Opens your shell in an isolated environment.{s}\n", .{ D, R });
-            print("{s}When you exit, review changes and apply or discard.{s}\n", .{ D, R });
-            print("\n{s}EXAMPLES{s}\n", .{ B, R });
-            print("  {s}${s} poof enter                        {s}# Sandbox current dir{s}\n", .{ D, R, D, R });
-            print("  {s}${s} poof enter /etc                   {s}# Sandbox /etc{s}\n", .{ D, R, D, R });
-            print("  {s}${s} cd myproject && poof enter        {s}# Edit safely{s}\n", .{ D, R, D, R });
-            print("\n{s}OPTIONS{s}\n", .{ B, R });
-            print("  {s}-v, --verbose{s}       Show detailed progress\n", .{ G, R });
-            print("  {s}--timeout=<secs>{s}    Kill after N seconds\n", .{ G, R });
-            print("  {s}--memory=<size>{s}     Memory limit (e.g. 100M, 1G)\n", .{ G, R });
-            print("  {s}--pids=<max>{s}        Max processes\n\n", .{ G, R });
-        },
-    }
-}
-
 fn printUsage() void {
     const B = col(Color.bold);
     const C = col(Color.cyan);
@@ -1251,18 +1141,18 @@ fn printUsage() void {
         \\    {s}--no-keep{s}      destroy them when the command exits
         \\    {s}--keep=<dir>{s}   keep them in <dir> instead of a /tmp stash
         \\    {s}--yes{s}          apply them to the real directory as the command exits
+        \\  Either way the prompt accepts {s}d{s} for a diff of exactly those changes.
         \\
-    , .{ B, R, C, R, Y, R, G, R, C, R, D, R, B, R, C, R, D, R, C, R, C, R, C, R });
+    , .{ B, R, C, R, Y, R, C, R, G, R, C, R, D, R, B, R, C, R, D, R, C, R, C, R, C, R });
 
-    // Subcommands, and the mode words that are no longer needed
+    // Subcommands
     print(
         \\
         \\{s}COMMANDS{s}
         \\  {s}apply{s} <stash>              Replay a saved stash onto the host
         \\  {s}stash{s} list                 List stashes left in /tmp
-        \\  {s}exec{s} / {s}run{s} / {s}enter{s}         Deprecated mode words, still accepted
         \\
-    , .{ B, R, C, R, C, R, C, R, C, R, C, R });
+    , .{ B, R, C, R, C, R });
 
     // Options
     print(
@@ -1273,9 +1163,8 @@ fn printUsage() void {
         \\  {s}--timeout=<secs>{s}            Kill after N seconds {s}(exit code 124){s}
         \\  {s}--memory=<bytes>{s}            Memory limit {s}(e.g. 100M, 1G){s}
         \\  {s}--pids=<max>{s}                Max processes {s}(fork bomb protection){s}
-        \\  {s}--upper=<dir>{s}               Deprecated: use {s}--keep=<dir>{s}
         \\
-    , .{ B, R, G, R, G, R, G, R, G, R, D, R, G, R, D, R, G, R, D, R, G, R, G, R });
+    , .{ B, R, G, R, G, R, G, R, G, R, D, R, G, R, D, R, G, R, D, R });
 
     // Isolation
     print(
@@ -1322,9 +1211,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
 
     var keep_dir: ?[]const u8 = null;
-    var used_upper = false;
     var no_keep = false;
-    var alias: ?Alias = null;
     var sub: ?Subcommand = null;
     var apply_opt: ?[]const u8 = null;
     var assume_yes = false;
@@ -1337,7 +1224,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             // Help is the requested result, so it goes to stdout (exit 0).
             output.routeToStdout(true);
-            if (sub != null and sub.? == .apply) printApplyHelp() else if (alias) |a| printModeHelp(a) else printUsage();
+            if (sub != null and sub.? == .apply) printApplyHelp() else printUsage();
             output.routeToStdout(false);
             return 0;
         } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
@@ -1349,10 +1236,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             output.setVerbose(true);
         } else if (std.mem.startsWith(u8, arg, "--keep=")) {
             keep_dir = arg[7..];
-        } else if (std.mem.startsWith(u8, arg, "--upper=")) {
-            // The old name for --keep: it named the overlay mechanism, not the intent.
-            keep_dir = arg[8..];
-            used_upper = true;
         } else if (std.mem.eql(u8, arg, "--no-keep")) {
             no_keep = true;
         } else if (std.mem.startsWith(u8, arg, "--apply=")) {
@@ -1403,17 +1286,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--")) {
             cmd_start = i + 1;
             break;
-        } else if (std.mem.eql(u8, arg, "exec")) {
-            alias = .exec;
-        } else if (std.mem.eql(u8, arg, "run")) {
-            alias = .run;
-        } else if (std.mem.eql(u8, arg, "enter")) {
-            alias = .enter;
-        } else if (std.mem.eql(u8, arg, "apply") and alias == null) {
-            // Only a subcommand while no mode word precedes it, so `poof exec apply`
-            // still runs a program called apply.
+        } else if (std.mem.eql(u8, arg, "apply")) {
             sub = .apply;
-        } else if (std.mem.eql(u8, arg, "stash") and alias == null) {
+        } else if (std.mem.eql(u8, arg, "stash")) {
             sub = .stash;
         } else if (arg.len > 0 and arg[0] != '-') {
             if (sub != null) {
@@ -1459,17 +1334,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    // Deprecation notices for the old mode words. They come after the parse loop so
-    // that --help and --version stay clean on stdout.
-    if (alias) |a| {
-        switch (a) {
-            .exec => warn("'poof exec' is deprecated: poof --no-keep <program> does this", .{}),
-            .run => warn("'poof run' is deprecated: poof <program> does this", .{}),
-            .enter => warn("'poof enter' is deprecated: poof with no command does this", .{}),
-        }
-    }
-    if (used_upper) warn("--upper is deprecated: use --keep=<dir>", .{});
-
     // Axis one: what happens to the changes once the session ends.
     if (no_keep and keep_dir != null) {
         err("--keep and --no-keep conflict: --keep=<dir> stores the changes, --no-keep destroys them", .{});
@@ -1477,21 +1341,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     config.keep = if (no_keep) .none else if (keep_dir != null) .dir else .auto;
 
-    // `poof enter <dir>` took a directory where every other form takes a command. That
-    // quirk survives only with the deprecated word; the plain form is `cd <dir> && poof`.
-    var enter_dir: ?[]const u8 = null;
-    if (alias == .enter and cmd_start < args.len) {
-        if (cmd_start + 1 < args.len) {
-            err("enter takes at most one directory, got extra argument: {s}", .{args[cmd_start + 1]});
-            return 1;
-        }
-        enter_dir = args[cmd_start];
-        cmd_start = args.len; // consumed: it is a directory, not a command
-    }
-
     if (cmd_start >= args.len) {
-        // No command: the session is a shell. This is what `enter` used to name; the
-        // disposition of the changes comes from the flags, not from the shell.
+        // No command: the session is a shell. What happens to its changes is decided
+        // by the flags, not by the shell.
         const shell = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else "/bin/sh";
         const shell_args = allocator.alloc([]const u8, 1) catch {
             err("out of memory", .{});
@@ -1500,26 +1352,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         shell_args[0] = shell;
         config.command = shell_args;
 
-        var target = cwd;
-        if (enter_dir) |arg_dir| {
-            target = if (arg_dir.len > 0 and arg_dir[0] == '/')
-                arg_dir
-            else if (std.mem.eql(u8, cwd, "/"))
-                std.fmt.allocPrint(allocator, "/{s}", .{arg_dir}) catch {
-                    err("out of memory", .{});
-                    return 1;
-                }
-            else
-                std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, arg_dir }) catch {
-                    err("out of memory", .{});
-                    return 1;
-                };
-            if (!sandbox.isDirectory(target)) {
-                err("not a directory: {s}", .{target});
-                return 1;
-            }
-        }
-        config.cwd = target;
+        config.cwd = cwd;
     } else {
         config.command = args[cmd_start..];
     }

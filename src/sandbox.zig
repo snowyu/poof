@@ -1036,7 +1036,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
 
     // fuse-overlayfs refuses to read a directory that contains its own upperdir or
     // workdir (readdir fails with EIO), and with lowerdir=/ those always sit inside the
-    // tree the sandbox walks - so `ls` in the directory holding --upper would break.
+    // tree the sandbox walks - so `ls` in the directory holding --keep would break.
     // Kernel overlayfs hides upper/work from the merged view; emulate that here: hand
     // fuse a bind of upper's *parent* (upper and work must stay on one mount, or
     // copy-up's rename gets EXDEV) and shadow the originals with an empty bind.
@@ -1069,7 +1069,7 @@ pub fn setupOverlay(config: Config, use_kernel_overlay: bool) Maybe(void) {
                     fuse_work = std.fmt.allocPrint(allocator, "{s}/{s}", .{ store_dir, std.fs.path.basename(work_dir) }) catch return .{ .err = .NOMEM };
                     log("upper/work hidden from sandbox view (fuse)", .{});
                 },
-                // A mount root (e.g. --upper=/somewhere) cannot be bind mounted from
+                // A mount root (e.g. a --keep=/somewhere stash) cannot be bind mounted from
                 // inside a user namespace; fall back to the original layout.
                 .err => |e| log("cannot bind {s}: {} - keeping original layout", .{ upper_parent, e }),
             }

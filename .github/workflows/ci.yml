@@ -79,6 +79,9 @@ jobs:
       - name: Build
         run: zig build -Dgit-commit=$(git rev-parse --short HEAD)
 
+      - name: Run unit tests
+        run: zig build test
+
       - name: Run tests
         run: sudo -E env "PATH=$PATH" bun test
 

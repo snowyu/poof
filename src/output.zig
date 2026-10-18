@@ -42,6 +42,12 @@ pub fn init() void {
     use_color = c.isatty(std.posix.STDERR_FILENO) == 1;
 }
 
+/// Choose whether to colorize. init() decides from the environment; callers that
+/// capture the output rather than show it turn colors off.
+pub fn setColors(on: bool) void {
+    use_color = on;
+}
+
 pub fn setVerbose(v: bool) void {
     verbose_mode = v;
 }
@@ -75,6 +81,12 @@ fn printFmt(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
     writeFd(print_fd, s);
+}
+
+// Write bytes straight to wherever status output goes, for callers that buffer
+// their own text (the diff, which would otherwise be one syscall per line).
+pub fn writeOut(data: []const u8) void {
+    writeFd(print_fd, data);
 }
 
 pub fn col(color: []const u8) []const u8 {

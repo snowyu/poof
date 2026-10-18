@@ -18,10 +18,11 @@ set -euo pipefail
 # then on the whole tree is one filesystem the sandbox can overlay.
 #
 # bun and zig are bind mounted from the host, so the image only needs a shell
-# and coreutils. git is installed on top, because the diff view is `git diff
-# --no-index` and without it those tests skip; POOF_TEST_APT names more packages
-# (or "" for none, which is what an offline box wants). Everything is overridable
-# if the defaults miss:
+# and coreutils. git is installed on top for the tests that check a repository's
+# own uncommitted work stays out of poof's diff view - the diff itself needs no
+# git; without it those tests skip. POOF_TEST_APT names more packages (or "" for
+# none, which is what an offline box wants). Everything is overridable if the
+# defaults miss:
 #
 #   ./scripts/test-docker.sh
 #   POOF_TEST_IMAGE=debian:trixie-slim ./scripts/test-docker.sh

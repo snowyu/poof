@@ -9,10 +9,6 @@ const POOF_BIN = join(import.meta.dir, "../zig-out/bin/poof");
 let TEST_DIR: string;
 // Shell prompt: # for root, $ for non-root
 const SHELL_PROMPT = process.getuid?.() === 0 ? "# " : "$ ";
-// poof's diff view is `git diff --no-index`, so with no git on the box there is
-// nothing to show and the diff tests have nothing to assert on.
-const hasGit = spawnSync(["sh", "-c", "command -v git"]).exitCode === 0;
-
 // poof prints "Stashed changes in <dir>" when changes are kept; pull the path
 // out of the (possibly colorized) output so tests can assert on it and clean up.
 function stashPath(output: string): string | null {
@@ -20,7 +16,11 @@ function stashPath(output: string): string | null {
   return m ? m[1] : null;
 }
 
-// A stash is the upper dir plus its work dir beside it; remove both.
+// The diff tests that check a repo's *other* files stay out of the view need git
+// to create that repo; the diff itself no longer does.
+const hasGit = spawnSync(["sh", "-c", "command -v git"]).exitCode === 0;
+
+// A stash is the keep dir plus its work dir beside it; remove both.
 function cleanupStash(output: string) {
   const stash = stashPath(output);
   if (!stash) return;
@@ -37,8 +37,8 @@ class TerminalSession {
   private proc: ReturnType<typeof spawn>;
   private cursor = 0; // Track position for waitForNew
 
-  constructor(cwd: string, env?: Record<string, string>, args: string[] = [], mode = "enter") {
-    this.proc = spawn([POOF_BIN, mode, ...args], {
+  constructor(cwd: string, env?: Record<string, string>, args: string[] = []) {
+    this.proc = spawn([POOF_BIN, ...args], {
       cwd,
       env: { ...process.env, ...env },
       terminal: {
@@ -136,9 +136,13 @@ describe("poof CLI", () => {
       const output = result.stdout.toString();
       expect(output).toContain("USAGE");
       expect(output).toContain("COMMANDS");
-      expect(output).toContain("exec");
-      expect(output).toContain("run");
-      expect(output).toContain("enter");
+      expect(output).toContain("--keep");
+      expect(output).toContain("--no-keep");
+      // The old mode words are gone, not merely hidden: help must not mention
+      // them, or readers take them as still available.
+      for (const word of ["exec", "run ", "enter"]) {
+        expect(output).not.toContain(word);
+      }
       // Help is the requested result: it must be pipeable, not on stderr.
       expect(result.stderr.toString()).toBe("");
       expect(result.exitCode).toBe(0);
@@ -163,22 +167,21 @@ describe("poof CLI", () => {
       expect(result.exitCode).toBe(0);
     });
 
-    test("per-mode help after the subcommand", () => {
-      const cases: [string, string][] = [
-        ["exec", "poof exec"],
-        ["run", "poof run"],
-        ["enter", "poof enter"],
-      ];
-      for (const [mode, marker] of cases) {
-        const result = spawnSync([POOF_BIN, mode, "--help"]);
-        expect(result.stdout.toString()).toContain(marker);
-        expect(result.stdout.toString()).toContain("OPTIONS");
-        expect(result.exitCode).toBe(0);
-      }
+    // A subcommand's own help comes after the subcommand. `poof stash` has one
+    // subcommand, listed in the general help, so it has nothing of its own to add.
+    test("per-subcommand help", () => {
+      const apply = spawnSync([POOF_BIN, "apply", "--help"]);
+      expect(apply.stdout.toString()).toContain("poof apply");
+      expect(apply.stdout.toString()).toContain("OPTIONS");
+      expect(apply.exitCode).toBe(0);
+
+      const stash = spawnSync([POOF_BIN, "stash", "--help"]);
+      expect(stash.stdout.toString()).toContain("stash list");
+      expect(stash.exitCode).toBe(0);
     });
 
     test("no arguments enters shell mode (exits cleanly with no changes)", () => {
-      // poof with no args now defaults to enter mode
+      // no args is a shell session, decided by the flags, not a mode word
       const result = spawnSync([POOF_BIN]);
       const output = result.stderr.toString();
       expect(output).toContain("No changes made");
@@ -210,40 +213,40 @@ describe("poof CLI", () => {
   // ============================================================================
   // Exec Mode (Ephemeral)
   // ============================================================================
-  describe("exec mode", () => {
+  describe("ephemeral sessions (--no-keep)", () => {
     describe("basic execution", () => {
       test("runs command and exits with status 0", () => {
-        const result = spawnSync([POOF_BIN, "exec", "true"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "true"]);
         expect(result.exitCode).toBe(0);
       });
 
       test("propagates non-zero exit code", () => {
-        const result = spawnSync([POOF_BIN, "exec", "false"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "false"]);
         expect(result.exitCode).toBe(1);
       });
 
       test("propagates specific exit code (42)", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "exit 42"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "exit 42"]);
         expect(result.exitCode).toBe(42);
       });
 
       test("propagates exit code 255", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "exit 255"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "exit 255"]);
         expect(result.exitCode).toBe(255);
       });
 
       test("returns 127 for non-existent command", () => {
-        const result = spawnSync([POOF_BIN, "exec", "nonexistent-command-xyz"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "nonexistent-command-xyz"]);
         expect(result.exitCode).toBe(127);
       });
 
       test("passes arguments to command", () => {
-        const result = spawnSync([POOF_BIN, "exec", "echo", "hello", "world"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "echo", "hello", "world"]);
         expect(result.stdout.toString().trim()).toBe("hello world");
       });
 
       test("works with -- separator", () => {
-        const result = spawnSync([POOF_BIN, "exec", "--", "echo", "-n", "test"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "--", "echo", "-n", "test"]);
         expect(result.stdout.toString()).toBe("test");
       });
     });
@@ -252,7 +255,7 @@ describe("poof CLI", () => {
       test("file created inside does not exist outside", () => {
         const testFile = join(TEST_DIR, "exec-create.txt");
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           `echo "created" > ${testFile} && cat ${testFile}`
         ]);
         expect(result.stdout.toString().trim()).toBe("created");
@@ -263,7 +266,7 @@ describe("poof CLI", () => {
       test("can read existing files from host", () => {
         const testFile = join(TEST_DIR, "exec-read.txt");
         writeFileSync(testFile, "readable content");
-        const result = spawnSync([POOF_BIN, "exec", "cat", testFile]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "cat", testFile]);
         expect(result.stdout.toString().trim()).toBe("readable content");
       });
 
@@ -271,7 +274,7 @@ describe("poof CLI", () => {
         const testFile = join(TEST_DIR, "exec-modify.txt");
         writeFileSync(testFile, "original");
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           `echo "modified" > ${testFile} && cat ${testFile}`
         ]);
         expect(result.stdout.toString().trim()).toBe("modified");
@@ -282,7 +285,7 @@ describe("poof CLI", () => {
         const testFile = join(TEST_DIR, "exec-delete.txt");
         writeFileSync(testFile, "to be deleted");
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           `rm ${testFile} && test ! -f ${testFile} && echo "deleted"`
         ]);
         expect(result.stdout.toString().trim()).toBe("deleted");
@@ -292,7 +295,7 @@ describe("poof CLI", () => {
       test("directory creation is isolated", () => {
         const testDir = join(TEST_DIR, "exec-newdir");
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           `mkdir -p ${testDir}/subdir && test -d ${testDir}/subdir && echo "created"`
         ]);
         expect(result.stdout.toString().trim()).toBe("created");
@@ -304,7 +307,7 @@ describe("poof CLI", () => {
         const link = join(TEST_DIR, "exec-symlink-link");
         writeFileSync(target, "target content");
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           `ln -s ${target} ${link} && cat ${link}`
         ]);
         expect(result.stdout.toString().trim()).toBe("target content");
@@ -314,7 +317,7 @@ describe("poof CLI", () => {
 
     describe("device nodes", () => {
       test("/dev/null is available", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo test > /dev/null && echo ok"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "echo test > /dev/null && echo ok"]);
         expect(result.stdout.toString().trim()).toBe("ok");
         expect(result.exitCode).toBe(0);
       });
@@ -322,59 +325,59 @@ describe("poof CLI", () => {
       test("/dev/zero is available", () => {
         // od, not xxd: xxd is a vim companion tool and is often absent, whereas
         // od is in coreutils.
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "head -c 4 /dev/zero | od -An -tx1 | tr -d ' \\n'"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "head -c 4 /dev/zero | od -An -tx1 | tr -d ' \\n'"]);
         expect(result.stdout.toString().trim()).toBe("00000000");
         expect(result.exitCode).toBe(0);
       });
 
       test("/dev/urandom is available", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "head -c 16 /dev/urandom | wc -c"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "head -c 16 /dev/urandom | wc -c"]);
         expect(result.stdout.toString().trim()).toBe("16");
         expect(result.exitCode).toBe(0);
       });
 
       test("/dev/random is available", () => {
-        const result = spawnSync([POOF_BIN, "exec", "test", "-c", "/dev/random"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "test", "-c", "/dev/random"]);
         expect(result.exitCode).toBe(0);
       });
 
       test("disk devices are NOT available", () => {
         // /dev/sda, /dev/nvme*, etc should not be accessible
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "ls /dev/sd* /dev/nvme* 2>&1 || echo 'no disk devices'"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "ls /dev/sd* /dev/nvme* 2>&1 || echo 'no disk devices'"]);
         expect(result.stdout.toString()).toContain("no disk devices");
       });
 
       test("/dev/mem is NOT available", () => {
-        const result = spawnSync([POOF_BIN, "exec", "test", "-e", "/dev/mem"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "test", "-e", "/dev/mem"]);
         expect(result.exitCode).not.toBe(0);
       });
     });
 
     describe("environment", () => {
       test("sets IS_SANDBOX=1", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo $IS_SANDBOX"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "echo $IS_SANDBOX"]);
         expect(result.stdout.toString().trim()).toBe("1");
       });
 
       test("preserves environment variables", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo $MY_VAR"], {
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "echo $MY_VAR"], {
           env: { ...process.env, MY_VAR: "test-value" }
         });
         expect(result.stdout.toString().trim()).toBe("test-value");
       });
 
       test("preserves PATH", () => {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo $PATH"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "echo $PATH"]);
         expect(result.stdout.toString().trim()).toContain("/bin");
       });
 
       test("preserves cwd (non-/tmp)", () => {
-        const result = spawnSync([POOF_BIN, "exec", "pwd"], { cwd: "/var" });
+        const result = spawnSync([POOF_BIN, "--no-keep", "pwd"], { cwd: "/var" });
         expect(result.stdout.toString().trim()).toBe("/var");
       });
 
       test("cwd works in TEST_DIR", () => {
-        const result = spawnSync([POOF_BIN, "exec", "pwd"], { cwd: TEST_DIR });
+        const result = spawnSync([POOF_BIN, "--no-keep", "pwd"], { cwd: TEST_DIR });
         expect(result.stdout.toString().trim()).toBe(TEST_DIR);
       });
     });
@@ -382,7 +385,7 @@ describe("poof CLI", () => {
     describe("namespace isolation", () => {
       test("PID namespace shows low PID", () => {
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           "cat /proc/self/status | grep -E '^Pid:'"
         ]);
         expect(result.stdout.toString()).toMatch(/Pid:\s+[1-5]/);
@@ -392,7 +395,7 @@ describe("poof CLI", () => {
         const hostProcs = spawnSync(["ls", "/proc"]).stdout.toString()
           .split("\n").filter(p => /^\d+$/.test(p)).length;
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           "ls /proc | grep -E '^[0-9]+$' | wc -l"
         ]);
         const poofProcs = parseInt(result.stdout.toString().trim());
@@ -407,7 +410,7 @@ describe("poof CLI", () => {
         writeFileSync(hostMarker, "host");
         try {
           const result = spawnSync([
-            POOF_BIN, "exec", "sh", "-c",
+            POOF_BIN, "--no-keep", "sh", "-c",
             `test -f ${hostMarker} && echo "found" || echo "not found"`
           ]);
           expect(result.stdout.toString().trim()).toBe("not found");
@@ -418,7 +421,7 @@ describe("poof CLI", () => {
 
       test("/tmp is writable inside poof", () => {
         const result = spawnSync([
-          POOF_BIN, "exec", "sh", "-c",
+          POOF_BIN, "--no-keep", "sh", "-c",
           "echo test > /tmp/write-test && cat /tmp/write-test"
         ]);
         expect(result.stdout.toString().trim()).toBe("test");
@@ -428,42 +431,42 @@ describe("poof CLI", () => {
     describe("options", () => {
       test("--timeout kills long-running process", () => {
         const start = Date.now();
-        const result = spawnSync([POOF_BIN, "exec", "--timeout=1", "sleep", "60"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "--timeout=1", "sleep", "60"]);
         const elapsed = Date.now() - start;
         expect(result.exitCode).toBe(124);
         expect(elapsed).toBeLessThan(5000);
       });
 
       test("--timeout allows fast commands", () => {
-        const result = spawnSync([POOF_BIN, "exec", "--timeout=10", "echo", "fast"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "--timeout=10", "echo", "fast"]);
         expect(result.stdout.toString().trim()).toBe("fast");
         expect(result.exitCode).toBe(0);
       });
 
       test("-v shows verbose output", () => {
-        const result = spawnSync([POOF_BIN, "-v", "exec", "true"]);
+        const result = spawnSync([POOF_BIN, "-v", "--no-keep", "true"]);
         expect(result.stderr.toString()).toContain("uid=");
       });
 
       test("--verbose shows verbose output", () => {
-        const result = spawnSync([POOF_BIN, "--verbose", "exec", "true"]);
+        const result = spawnSync([POOF_BIN, "--verbose", "--no-keep", "true"]);
         expect(result.stderr.toString()).toContain("uid=");
       });
 
       test("invalid --timeout shows error", () => {
-        const result = spawnSync([POOF_BIN, "exec", "--timeout=abc", "true"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "--timeout=abc", "true"]);
         expect(result.stderr.toString()).toContain("invalid timeout");
         expect(result.exitCode).toBe(1);
       });
 
       test("invalid --memory shows error", () => {
-        const result = spawnSync([POOF_BIN, "exec", "--memory=invalid", "true"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "--memory=invalid", "true"]);
         expect(result.stderr.toString()).toContain("invalid memory limit");
         expect(result.exitCode).toBe(1);
       });
 
       test("invalid --pids shows error", () => {
-        const result = spawnSync([POOF_BIN, "exec", "--pids=abc", "true"]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "--pids=abc", "true"]);
         expect(result.stderr.toString()).toContain("invalid pids limit");
         expect(result.exitCode).toBe(1);
       });
@@ -475,7 +478,7 @@ describe("poof CLI", () => {
           ["--pids=0", "invalid pids limit"],
         ];
         for (const [opt, marker] of cases) {
-          const result = spawnSync([POOF_BIN, "exec", opt, "--", "true"]);
+          const result = spawnSync([POOF_BIN, "--no-keep", opt, "--", "true"]);
           expect(result.stderr.toString()).toContain(marker);
           expect(result.exitCode).toBe(1);
         }
@@ -536,7 +539,7 @@ describe("poof CLI", () => {
 
     mountTest("warns when the working directory sits on a mount poof does not overlay", () => {
       const dir = nestedDir!;
-      const result = spawnSync([POOF_BIN, "exec", "--", "true"], { cwd: dir });
+      const result = spawnSync([POOF_BIN, "--no-keep", "--", "true"], { cwd: dir });
       const output = result.stderr.toString();
       expect(output).toContain("not the root filesystem");
       expect(output).toContain(dir);
@@ -547,16 +550,16 @@ describe("poof CLI", () => {
 
     mountTest("warns when the working directory is the mount point itself", () => {
       const base = nestedBase!;
-      const result = spawnSync([POOF_BIN, "exec", "--", "true"], { cwd: base });
+      const result = spawnSync([POOF_BIN, "--no-keep", "--", "true"], { cwd: base });
       const output = result.stderr.toString();
       expect(output).toContain(`mount at ${base}`);
       expect(result.exitCode).toBe(0);
     });
 
-    mountTest("run mode warns too, before the session starts", () => {
+    mountTest("a scripted session warns too, before it starts", () => {
       const dir = nestedDir!;
       const result = spawnSync(
-        [POOF_BIN, "run", `--upper=${join(TEST_DIR, "nested-upper")}`, "--", "true"],
+        [POOF_BIN, `--keep=${join(TEST_DIR, "nested-upper")}`, "--", "true"],
         { cwd: dir },
       );
       const output = result.stdout.toString() + result.stderr.toString();
@@ -566,7 +569,7 @@ describe("poof CLI", () => {
 
     test("says nothing when the working directory is on the root filesystem", () => {
       if (deepestMount(TEST_DIR) !== "/") return; // TEST_DIR is itself on a mount here
-      const result = spawnSync([POOF_BIN, "exec", "--", "true"], { cwd: TEST_DIR });
+      const result = spawnSync([POOF_BIN, "--no-keep", "--", "true"], { cwd: TEST_DIR });
       expect(result.stderr.toString()).not.toContain("not the root filesystem");
       expect(result.exitCode).toBe(0);
     });
@@ -584,13 +587,13 @@ describe("poof CLI", () => {
         ["USR1", 138],
       ];
       for (const [sig, code] of cases) {
-        const result = spawnSync([POOF_BIN, "exec", "sh", "-c", `kill -${sig} $$`]);
+        const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", `kill -${sig} $$`]);
         expect(result.exitCode).toBe(code);
       }
     });
 
     test("exit code 0 for a command that succeeds after work", () => {
-      const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo hi > /tmp/x && exit 0"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "echo hi > /tmp/x && exit 0"]);
       expect(result.exitCode).toBe(0);
     });
   });
@@ -603,12 +606,12 @@ describe("poof CLI", () => {
     // a limited child cgroup. Some containers refuse that; poof then fails loudly,
     // and these enforcement tests are skipped rather than falsely failing.
     const limitsAvailable = (() => {
-      const probe = spawnSync([POOF_BIN, "exec", "--memory=64M", "--", "true"]);
+      const probe = spawnSync([POOF_BIN, "--no-keep", "--memory=64M", "--", "true"]);
       return probe.exitCode === 0;
     })();
 
     test("limits are never silently ignored", () => {
-      const result = spawnSync([POOF_BIN, "exec", "--memory=64M", "--", "true"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "--memory=64M", "--", "true"]);
       if (result.exitCode !== 0) {
         // If limits cannot be applied, poof must say so instead of running unlimited.
         expect(result.stderr.toString()).toContain("cannot apply --memory/--pids");
@@ -619,7 +622,7 @@ describe("poof CLI", () => {
 
     maybeTest("--memory kills a process that exceeds the limit", () => {
       const result = spawnSync(
-        [POOF_BIN, "exec", "--timeout=60", "--memory=100M", "--", "sh", "-c",
+        [POOF_BIN, "--no-keep", "--timeout=60", "--memory=100M", "--", "sh", "-c",
           'a=$(head -c 200000000 /dev/zero | tr "\\0" "x"); echo got ${#a}'],
         { timeout: 90_000 },
       );
@@ -628,7 +631,7 @@ describe("poof CLI", () => {
 
     maybeTest("--memory leaves a small allocation alone", () => {
       const result = spawnSync(
-        [POOF_BIN, "exec", "--timeout=60", "--memory=100M", "--", "sh", "-c",
+        [POOF_BIN, "--no-keep", "--timeout=60", "--memory=100M", "--", "sh", "-c",
           'a=$(head -c 10000000 /dev/zero | tr "\\0" "x"); echo got ${#a}'],
         { timeout: 90_000 },
       );
@@ -637,14 +640,14 @@ describe("poof CLI", () => {
     });
 
     test("a --pids limit too small to boot the sandbox is rejected up front", () => {
-      const result = spawnSync([POOF_BIN, "exec", "--pids=1", "--", "true"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "--pids=1", "--", "true"]);
       expect(result.stderr.toString()).toContain("needs at least 2 processes");
       expect(result.exitCode).toBe(1);
     });
 
     maybeTest("a --pids limit that starves the sandbox fails cleanly, not with a crash", () => {
       // 2 slots cannot hold the namespace init, the FUSE daemon and the command.
-      const result = spawnSync([POOF_BIN, "exec", "--pids=2", "--", "true"], { timeout: 30_000 });
+      const result = spawnSync([POOF_BIN, "--no-keep", "--pids=2", "--", "true"], { timeout: 30_000 });
       const output = result.stderr.toString();
       expect(output).not.toContain("panic");
       expect(output).not.toContain("Segmentation");
@@ -657,7 +660,7 @@ describe("poof CLI", () => {
 
     maybeTest("--memory, --pids and --timeout combine", () => {
       const result = spawnSync(
-        [POOF_BIN, "exec", "--memory=1G", "--pids=100", "--timeout=30", "--", "sh", "-c", "echo combined-ok"],
+        [POOF_BIN, "--no-keep", "--memory=1G", "--pids=100", "--timeout=30", "--", "sh", "-c", "echo combined-ok"],
         { timeout: 60_000 },
       );
       expect(result.stdout.toString()).toContain("combined-ok");
@@ -666,7 +669,7 @@ describe("poof CLI", () => {
 
     maybeTest("--pids stops a fork bomb", () => {
       const result = spawnSync(
-        [POOF_BIN, "exec", "--timeout=30", "--pids=10", "--", "sh", "-c",
+        [POOF_BIN, "--no-keep", "--timeout=30", "--pids=10", "--", "sh", "-c",
           "i=0; while [ $i -lt 50 ]; do (sleep 5) & i=$((i+1)); done; echo started=$i"],
         { timeout: 60_000 },
       );
@@ -679,7 +682,7 @@ describe("poof CLI", () => {
   // ============================================================================
   // Run Mode (Persistent)
   // ============================================================================
-  describe("run mode", () => {
+  describe("keeping changes", () => {
     let runTestDir: string;
 
     beforeEach(() => {
@@ -705,7 +708,7 @@ describe("poof CLI", () => {
         const testFile = join(runTestDir, "newfile.txt");
 
         const result = spawnSync([
-          POOF_BIN, "run", `--upper=${upperDir}`, "sh", "-c",
+          POOF_BIN, `--keep=${upperDir}`, "sh", "-c",
           `echo "persisted" > ${testFile}`
         ]);
         expect(result.exitCode).toBe(0);
@@ -722,7 +725,7 @@ describe("poof CLI", () => {
         writeFileSync(testFile, "original");
 
         const result = spawnSync([
-          POOF_BIN, "run", `--upper=${upperDir}`, "sh", "-c",
+          POOF_BIN, `--keep=${upperDir}`, "sh", "-c",
           `echo "modified" > ${testFile}`
         ]);
         expect(result.exitCode).toBe(0);
@@ -739,7 +742,7 @@ describe("poof CLI", () => {
         const newDir = join(runTestDir, "newdir", "subdir");
 
         const result = spawnSync([
-          POOF_BIN, "run", `--upper=${upperDir}`, "sh", "-c",
+          POOF_BIN, `--keep=${upperDir}`, "sh", "-c",
           `mkdir -p ${newDir} && echo "test" > ${newDir}/file.txt`
         ]);
         expect(result.exitCode).toBe(0);
@@ -753,7 +756,7 @@ describe("poof CLI", () => {
         const upperDir = join(runTestDir, "upper");
 
         const result = spawnSync([
-          POOF_BIN, "run", `--upper=${upperDir}`, "sh", "-c",
+          POOF_BIN, `--keep=${upperDir}`, "sh", "-c",
           `echo "a" > ${runTestDir}/a.txt && echo "b" > ${runTestDir}/b.txt && echo "c" > ${runTestDir}/c.txt`
         ]);
         expect(result.exitCode).toBe(0);
@@ -784,7 +787,7 @@ describe("poof CLI", () => {
         const before = readdirSync(runTestDir);
 
         const result = spawnSync([
-          POOF_BIN, "run", "sh", "-c", `echo hi > ${runTestDir}/stash-src.txt`
+          POOF_BIN, "sh", "-c", `echo hi > ${runTestDir}/stash-src.txt`
         ], { cwd: runTestDir });
         const output = result.stderr.toString();
         expect(result.exitCode).toBe(0);
@@ -804,7 +807,7 @@ describe("poof CLI", () => {
 
       test("poof stash list finds the auto stash", () => {
         const result = spawnSync([
-          POOF_BIN, "run", "sh", "-c", `echo hi > ${runTestDir}/listed.txt`
+          POOF_BIN, "sh", "-c", `echo hi > ${runTestDir}/listed.txt`
         ], { cwd: runTestDir });
         const stash = keptPath(result.stderr.toString());
         expect(stash).not.toBeNull();
@@ -817,9 +820,9 @@ describe("poof CLI", () => {
     });
 
     describe("relative paths", () => {
-      test("--upper with relative path works", () => {
+      test("--keep with a relative path works", () => {
         const result = spawnSync([
-          POOF_BIN, "run", "--upper=my-changes", "sh", "-c",
+          POOF_BIN, "--keep=my-changes", "sh", "-c",
           `echo "test" > ${runTestDir}/reltest.txt`
         ], { cwd: runTestDir });
         expect(result.exitCode).toBe(0);
@@ -833,30 +836,30 @@ describe("poof CLI", () => {
       });
     });
 
-    describe("upper directory handling", () => {
-      test("--upper pointing at a file fails with a clear error", () => {
+    describe("keep directory handling", () => {
+      test("--keep pointing at a file fails with a clear error", () => {
         const notADir = join(runTestDir, "afile");
         writeFileSync(notADir, "x");
 
-        const result = spawnSync([POOF_BIN, "run", `--upper=${notADir}`, "true"]);
+        const result = spawnSync([POOF_BIN, `--keep=${notADir}`, "true"]);
         expect(result.stderr.toString()).toContain("not a directory");
         expect(result.exitCode).toBe(1);
       });
 
-      test("--upper creates missing parent directories", () => {
+      test("--keep creates missing parent directories", () => {
         const upperDir = join(runTestDir, "deep", "nested", "upper");
         const result = spawnSync([
-          POOF_BIN, "run", `--upper=${upperDir}`, "sh", "-c",
+          POOF_BIN, `--keep=${upperDir}`, "sh", "-c",
           `echo deep > ${runTestDir}/deepfile.txt`
         ]);
         expect(result.exitCode).toBe(0);
         expect(existsSync(join(upperDir, runTestDir, "deepfile.txt"))).toBe(true);
       });
 
-      test("run mode leaves no merged mount point beside upper", () => {
+      test("a scripted session leaves no merged mount point beside the stash", () => {
         const upperDir = join(runTestDir, "cleanupper");
         const result = spawnSync([
-          POOF_BIN, "run", `--upper=${upperDir}`, "sh", "-c",
+          POOF_BIN, `--keep=${upperDir}`, "sh", "-c",
           `echo x > ${runTestDir}/f.txt`
         ]);
         expect(result.exitCode).toBe(0);
@@ -869,9 +872,9 @@ describe("poof CLI", () => {
   });
 
   // ============================================================================
-  // Enter Mode (Interactive with PTY)
+  // A session with no command is a shell, sandboxing the cwd (interactive PTY)
   // ============================================================================
-  describe("enter mode", () => {
+  describe("shell sessions", () => {
     let enterTestDir: string;
 
     beforeEach(() => {
@@ -904,16 +907,14 @@ describe("poof CLI", () => {
       expect(session.output).toContain("No changes made");
     });
 
-    test("enter <directory> sandboxes that directory, not the cwd", async () => {
-      const targetDir = mkdtempSync(join(TEST_DIR, "enter-target-"));
-      const newFile = join(targetDir, "from-enter-arg.txt");
+    // A session always sandboxes the cwd: reaching another directory is what
+    // `cd <dir> && poof` is for, so a directory argument is a command, not a target.
+    test("a session sandboxes the cwd, and a directory is not a command", async () => {
+      const targetDir = mkdtempSync(join(TEST_DIR, "shell-target-"));
+      const newFile = join(targetDir, "from-shell.txt");
 
-      // cwd is enterTestDir, but the session is asked to sandbox targetDir
-      const session = new TerminalSession(enterTestDir, undefined, [targetDir]);
-
+      const session = new TerminalSession(targetDir);
       await session.waitForNew(SHELL_PROMPT);
-
-      // The shell must start inside the requested directory
       session.write("pwd\n");
       await session.waitForNew(targetDir);
 
@@ -922,19 +923,16 @@ describe("poof CLI", () => {
 
       session.write("exit\n");
       await session.waitForNew("]: ");
-
       session.write("y\n");
       await session.waitFor("Changes applied");
       await session.waitForExit();
 
       expect(existsSync(newFile)).toBe(true);
-      rmSync(targetDir, { recursive: true, force: true });
-    });
 
-    test("enter with a missing directory fails clearly", () => {
-      const result = spawnSync([POOF_BIN, "enter", join(TEST_DIR, "no-such-dir")]);
-      expect(result.stderr.toString()).toContain("not a directory");
-      expect(result.exitCode).toBe(1);
+      const asCommand = spawnSync([POOF_BIN, targetDir], { cwd: enterTestDir });
+      expect(asCommand.exitCode).toBe(126);
+
+      rmSync(targetDir, { recursive: true, force: true });
     });
 
     test("creates file and shows in diff", async () => {
@@ -1003,7 +1001,7 @@ describe("poof CLI", () => {
       cleanupStash(session.output);
     });
 
-    (hasGit ? test : test.skip)("shows diff when user presses d", async () => {
+    test("shows diff when user presses d", async () => {
       const testFile = join(enterTestDir, "difftest.txt");
       const session = new TerminalSession(enterTestDir);
 
@@ -1020,6 +1018,10 @@ describe("poof CLI", () => {
 
       session.write("d\n");
       await session.waitFor("diff line 1");
+      // poof's own unified diff, not a listing: hunk headers are what tell the
+      // added lines apart from the unchanged ones.
+      await session.waitForNew("@@ -0,0 +1,2 @@");
+      await session.waitForNew("+diff line 2");
       await session.waitForNew("[y/N]");
 
       session.write("n\n");
@@ -1153,33 +1155,12 @@ describe("poof CLI", () => {
       cleanupStash(session.output);
     }, 20_000);
 
-    test("a relative directory argument is resolved against the cwd", async () => {
-      const subDir = join(enterTestDir, "relative-target");
-      mkdirSync(subDir);
-
-      const session = new TerminalSession(enterTestDir, undefined, ["relative-target"]);
-
-      await session.waitForNew(SHELL_PROMPT);
-
-      session.write("pwd\n");
-      await session.waitForNew(subDir);
-
-      session.write("exit\n");
-      await session.waitFor("No changes made");
-      await session.waitForExit();
-    });
-
-    test("more than one directory argument is rejected", () => {
-      const result = spawnSync([POOF_BIN, "enter", TEST_DIR, "/var"]);
-      expect(result.stderr.toString()).toContain("at most one directory");
-      expect(result.exitCode).toBe(1);
-    });
   });
 
   // ============================================================================
   // Run Mode (Interactive) — the documented "review & apply" flow
   // ============================================================================
-  describe("run mode (interactive)", () => {
+  describe("the review & apply flow", () => {
     let runDir: string;
 
     beforeEach(() => {
@@ -1199,7 +1180,7 @@ describe("poof CLI", () => {
 
     test("shows the change summary and prompt after the command exits", async () => {
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `echo hi > ${runDir}/prompt-me.txt`], "run");
+        runDir, undefined, ["sh", "-c", `echo hi > ${runDir}/prompt-me.txt`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       expect(session.output).toContain("1 changed file");
@@ -1215,7 +1196,7 @@ describe("poof CLI", () => {
     test("applies changes when the user confirms with y", async () => {
       const testFile = join(runDir, "run-applied.txt");
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `echo applied > ${testFile}`], "run");
+        runDir, undefined, ["sh", "-c", `echo applied > ${testFile}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       session.write("y\n");
@@ -1233,7 +1214,7 @@ describe("poof CLI", () => {
       writeFileSync(kept, "keep me\n");
 
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `rm ${doomed}`], "run");
+        runDir, undefined, ["sh", "-c", `rm ${doomed}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       expect(session.output).toContain("doomed.txt");
@@ -1254,7 +1235,7 @@ describe("poof CLI", () => {
       writeFileSync(script, "#!/bin/sh\necho hi\n");
 
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `chmod 750 ${script}`], "run");
+        runDir, undefined, ["sh", "-c", `chmod 750 ${script}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       session.write("y\n");
@@ -1268,7 +1249,7 @@ describe("poof CLI", () => {
       const link = join(runDir, "link-to-nothing");
 
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `ln -s /does-not-exist ${link}`], "run");
+        runDir, undefined, ["sh", "-c", `ln -s /does-not-exist ${link}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       session.write("y\n");
@@ -1286,8 +1267,7 @@ describe("poof CLI", () => {
 
       const session = new TerminalSession(
         runDir, undefined,
-        ["sh", "-c", `mkdir -p ${join(runDir, "sub/deep")} && echo v2 > ${nested} && echo v2 > ${edited}`],
-        "run");
+        ["sh", "-c", `mkdir -p ${join(runDir, "sub/deep")} && echo v2 > ${nested} && echo v2 > ${edited}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       session.write("y\n");
@@ -1300,7 +1280,7 @@ describe("poof CLI", () => {
 
     test("applying creates a directory that is empty inside the sandbox", async () => {
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `mkdir -p ${join(runDir, "empty-dir")}`], "run");
+        runDir, undefined, ["sh", "-c", `mkdir -p ${join(runDir, "empty-dir")}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       expect(session.output).toContain("empty-dir/");
@@ -1315,8 +1295,7 @@ describe("poof CLI", () => {
     test("the change summary ignores overlay bookkeeping markers", async () => {
       const session = new TerminalSession(
         runDir, undefined,
-        ["sh", "-c", `mkdir -p ${join(runDir, "newdir/deeper")} && echo x > ${join(runDir, "newdir/deeper/f.txt")}`],
-        "run");
+        ["sh", "-c", `mkdir -p ${join(runDir, "newdir/deeper")} && echo x > ${join(runDir, "newdir/deeper/f.txt")}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       // A directory created inside the sandbox carries .wh..wh..opq / .wh..opq
@@ -1332,7 +1311,7 @@ describe("poof CLI", () => {
     test("discards on n but keeps the stash", async () => {
       const testFile = join(runDir, "run-discarded.txt");
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `echo gone > ${testFile}`], "run");
+        runDir, undefined, ["sh", "-c", `echo gone > ${testFile}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       session.write("n\n");
@@ -1349,10 +1328,10 @@ describe("poof CLI", () => {
       rmSync(stash!, { recursive: true, force: true });
     });
 
-    (hasGit ? test : test.skip)("d shows the full diff, then y applies", async () => {
+    test("d shows the diff, then y applies", async () => {
       const testFile = join(runDir, "run-diff.txt");
       const session = new TerminalSession(
-        runDir, undefined, ["sh", "-c", `echo diff-marker-91 > ${testFile}`], "run");
+        runDir, undefined, ["sh", "-c", `echo diff-marker-91 > ${testFile}`]);
 
       await session.waitForNew("[y/N/d(iff)]");
       session.write("d\n");
@@ -1366,11 +1345,70 @@ describe("poof CLI", () => {
       expect(existsSync(testFile)).toBe(true);
     });
 
+    // The diff used to shell out to `git diff --no-index`, which reported every
+    // change in the surrounding repo rather than the ones this session made: a
+    // dirty file the session never touched showed up as if poof had made it.
+    (hasGit ? test : test.skip)("the diff covers only this session's changes, not the repo", async () => {
+      const repoDir = mkdtempSync(join(TEST_DIR, "repodiff-"));
+      const git = (argv: string[]) => spawnSync(["git", "-C", repoDir, ...argv], {
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "poof-test", GIT_AUTHOR_EMAIL: "poof@test",
+          GIT_COMMITTER_NAME: "poof-test", GIT_COMMITTER_EMAIL: "poof@test",
+        },
+      });
+      expect(git(["init", "-q"]).exitCode).toBe(0);
+      writeFileSync(join(repoDir, "tracked.txt"), "committed\n");
+      writeFileSync(join(repoDir, "dirty.txt"), "committed\n");
+      expect(git(["add", "-A"]).exitCode).toBe(0);
+      expect(git(["commit", "-q", "-m", "init"]).exitCode).toBe(0);
+      // The repo is dirty before poof starts, in a file poof never touches.
+      writeFileSync(join(repoDir, "dirty.txt"), "not poof's doing\n");
+
+      const session = new TerminalSession(
+        repoDir, undefined, ["sh", "-c", `echo session-change > ${join(repoDir, "tracked.txt")}`]);
+
+      await session.waitForNew("[y/N/d(iff)]");
+      session.write("d\n");
+      await session.waitFor("session-change");
+      await session.waitForNew("[y/N]");
+
+      expect(session.output).toContain("tracked.txt");
+      expect(session.output).not.toContain("dirty.txt");
+      expect(session.output).not.toContain("not poof's doing");
+
+      session.write("n\n");
+      await session.waitForExit();
+      cleanupStash(session.output);
+      rmSync(repoDir, { recursive: true, force: true });
+    });
+
+    // No git, no temp files, no external process: the diff is poof's own, so it
+    // is there whenever there is something to show.
+    test("the diff needs no git", async () => {
+      const testFile = join(runDir, "plain.txt");
+      writeFileSync(testFile, "start\n");
+
+      const session = new TerminalSession(
+        runDir, undefined, ["sh", "-c", `echo wrote > ${testFile}`]);
+
+      await session.waitForNew("[y/N/d(iff)]");
+      session.write("d\n");
+      await session.waitFor("@@ -1 +1 @@");
+      await session.waitForNew("-start");
+      await session.waitForNew("+wrote");
+      await session.waitForNew("[y/N]");
+
+      session.write("n\n");
+      await session.waitForExit();
+      cleanupStash(session.output);
+    });
+
     test("--timeout stashes the changes made before the kill", async () => {
       const testFile = join(runDir, "run-timeout.txt");
       const session = new TerminalSession(
         runDir, undefined,
-        ["--timeout=2", "sh", "-c", `echo late > ${testFile} && sleep 30`], "run");
+        ["--timeout=2", "sh", "-c", `echo late > ${testFile} && sleep 30`]);
 
       const code = await session.waitForExit();
       expect(code).toBe(124);
@@ -1639,11 +1677,11 @@ describe("poof CLI", () => {
       expect(r.exitCode).toBe(0);
     });
 
-    test("poof run --apply=<stash> applies without starting a sandbox", () => {
+    test("poof --apply=<stash> applies without starting a sandbox", () => {
       mkdirSync(mirror(targetDir), { recursive: true });
       writeFileSync(join(mirror(targetDir), "via-run.txt"), "via run\n");
 
-      const r = spawnSync([POOF_BIN, "run", `--apply=${stashDir}`, "--yes"]);
+      const r = spawnSync([POOF_BIN, `--apply=${stashDir}`, "--yes"]);
       expect(r.exitCode).toBe(0);
       expect(readFileSync(join(targetDir, "via-run.txt"), "utf8")).toBe("via run\n");
       expect(existsSync(stashDir)).toBe(false);
@@ -1685,7 +1723,7 @@ describe("poof CLI", () => {
       const victim = join(dir, "victim.txt");
       writeFileSync(victim, "delete me\n");
 
-      const session = new TerminalSession(dir, undefined, ["sh", "-c", `rm ${victim}`], "run");
+      const session = new TerminalSession(dir, undefined, ["sh", "-c", `rm ${victim}`]);
       await session.waitForNew("[y/N/d(iff)]");
       session.write("n\n"); // decline in the session, apply it later via the stash
       await session.waitFor("Stashed changes in");
@@ -1725,7 +1763,7 @@ describe("poof CLI", () => {
       const victim = join(dir, "victim.txt");
       writeFileSync(victim, "delete me\n");
 
-      const run = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", `rm ${victim}`]);
+      const run = spawnSync([POOF_BIN, `--keep=${upper}`, "--", "sh", "-c", `rm ${victim}`]);
       expect(run.exitCode).toBe(0);
 
       // The kernel's whiteout form: a character device whose rdev is 0:0.
@@ -1744,7 +1782,7 @@ describe("poof CLI", () => {
       mkdirSync(join(dir, "sub", "deep"), { recursive: true });
       writeFileSync(join(dir, "sub", "deep", "inner.txt"), "inner\n");
 
-      const run = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", `rm -rf ${dir}/sub`]);
+      const run = spawnSync([POOF_BIN, `--keep=${upper}`, "--", "sh", "-c", `rm -rf ${dir}/sub`]);
       expect(run.exitCode).toBe(0);
 
       const r = spawnSync([POOF_BIN, "apply", upper, "--yes"]);
@@ -1763,7 +1801,7 @@ describe("poof CLI", () => {
       writeFileSync(join(dir, "sub", "old.txt"), "old\n");
 
       const run = spawnSync([
-        POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c",
+        POOF_BIN, `--keep=${upper}`, "--", "sh", "-c",
         `rm -rf ${dir}/sub && mkdir ${dir}/sub && echo new > ${dir}/sub/new.txt`,
       ]);
       expect(run.exitCode).toBe(0);
@@ -1781,7 +1819,7 @@ describe("poof CLI", () => {
       writeFileSync(join(dir, "sub", "a.txt"), "a\n");
       writeFileSync(join(dir, "sub", "b.txt"), "b\n");
 
-      const run = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", `rm -rf ${dir}/sub && mkdir ${dir}/sub`]);
+      const run = spawnSync([POOF_BIN, `--keep=${upper}`, "--", "sh", "-c", `rm -rf ${dir}/sub && mkdir ${dir}/sub`]);
       expect(run.exitCode).toBe(0);
 
       const r = spawnSync([POOF_BIN, "apply", upper, "--yes"]);
@@ -1798,13 +1836,13 @@ describe("poof CLI", () => {
     test("stdin reaches the sandboxed command", () => {
       const f = join(TEST_DIR, "stdin-file.txt");
       writeFileSync(f, "piped-through");
-      const result = spawnSync(["sh", "-c", `${POOF_BIN} exec cat < ${f}`]);
+      const result = spawnSync(["sh", "-c", `${POOF_BIN} cat < ${f}`]);
       expect(result.stdout.toString()).toBe("piped-through");
       expect(result.exitCode).toBe(0);
     });
 
     test("the command's stderr reaches the caller", () => {
-      const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo to-stderr >&2"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "echo to-stderr >&2"]);
       expect(result.stderr.toString()).toContain("to-stderr");
     });
 
@@ -1813,13 +1851,13 @@ describe("poof CLI", () => {
     // before the mount has started. That is the daemon's business, not the command's:
     // poof captures its stderr and only shows it when the mount actually fails.
     test("the overlay daemon's startup chatter stays out of the output", () => {
-      const result = spawnSync([POOF_BIN, "exec", "--", "true"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "--", "true"]);
       expect(result.stderr.toString()).not.toContain("unknown argument ignored");
       expect(result.exitCode).toBe(0);
     });
 
     test("large stdout is not truncated", () => {
-      const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "head -c 200000 /dev/urandom | wc -c"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "head -c 200000 /dev/urandom | wc -c"]);
       expect(result.stdout.toString().trim()).toBe("200000");
     });
   });
@@ -1829,16 +1867,16 @@ describe("poof CLI", () => {
   // ============================================================================
   describe("device nodes (documented set)", () => {
     test("/dev/full rejects writes", () => {
-      const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "echo x > /dev/full 2>/dev/null; echo rc=$?"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "echo x > /dev/full 2>/dev/null; echo rc=$?"]);
       expect(result.stdout.toString().trim()).toBe("rc=1");
     });
 
     test("/dev/tty is available", () => {
-      expect(spawnSync([POOF_BIN, "exec", "test", "-c", "/dev/tty"]).exitCode).toBe(0);
+      expect(spawnSync([POOF_BIN, "--no-keep", "test", "-c", "/dev/tty"]).exitCode).toBe(0);
     });
 
     test("/dev/ptmx is available (private devpts)", () => {
-      const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "test -c /dev/ptmx && echo ptmx-ok"]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "test -c /dev/ptmx && echo ptmx-ok"]);
       expect(result.stdout.toString().trim()).toBe("ptmx-ok");
     });
   });
@@ -1852,7 +1890,7 @@ describe("poof CLI", () => {
 
     maybeTest("a hostname set inside the sandbox does not leak to the host", () => {
       const before = spawnSync(["uname", "-n"]).stdout.toString().trim();
-      const inside = spawnSync([POOF_BIN, "exec", "sh", "-c", "hostname poof-uts-check && hostname"]);
+      const inside = spawnSync([POOF_BIN, "--no-keep", "sh", "-c", "hostname poof-uts-check && hostname"]);
       expect(inside.stdout.toString().trim()).toBe("poof-uts-check");
       expect(spawnSync(["uname", "-n"]).stdout.toString().trim()).toBe(before);
     });
@@ -1870,7 +1908,7 @@ describe("poof CLI", () => {
     // the failure mode here, not a wrong code.
     test("SIGTERM at any point in startup exits 143 rather than hanging", async () => {
       for (const delay of [200, 400, 600, 800, 1000]) {
-        const proc = spawn([POOF_BIN, "exec", "--", "sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+        const proc = spawn([POOF_BIN, "--no-keep", "--", "sleep", "30"], { stdout: "ignore", stderr: "ignore" });
         await Bun.sleep(delay);
         proc.kill(15);
         const code = await Promise.race([proc.exited, Bun.sleep(4000).then(() => null)]);
@@ -1884,7 +1922,7 @@ describe("poof CLI", () => {
     }, 30000);
 
     test("SIGINT exits 130", async () => {
-      const proc = spawn([POOF_BIN, "exec", "--", "sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+      const proc = spawn([POOF_BIN, "--no-keep", "--", "sleep", "30"], { stdout: "ignore", stderr: "ignore" });
       await Bun.sleep(500);
       proc.kill(2);
       expect(await proc.exited).toBe(130);
@@ -1896,7 +1934,7 @@ describe("poof CLI", () => {
     test("SIGINT in an interactive session keeps its changes in a listed stash", async () => {
       const dir = mkdtempSync(join(TEST_DIR, "sigint-"));
       const made = join(dir, "sigint-kept.txt");
-      const session = new TerminalSession(dir, undefined, [], "run");
+      const session = new TerminalSession(dir, undefined, []);
 
       await session.waitForNew(SHELL_PROMPT);
       session.write(`echo kept > ${made}\n`);
@@ -1922,13 +1960,13 @@ describe("poof CLI", () => {
   // ============================================================================
   describe("color output", () => {
     test("colors are used when stderr is a terminal", async () => {
-      const session = new TerminalSession(TEST_DIR, undefined, ["--unknown"], "exec");
+      const session = new TerminalSession(TEST_DIR, undefined, ["--unknown"]);
       await session.waitForExit();
       expect(session.output).toContain("\u001b[");
     });
 
     test("NO_COLOR=1 disables colors even on a terminal", async () => {
-      const session = new TerminalSession(TEST_DIR, { NO_COLOR: "1" }, ["--unknown"], "exec");
+      const session = new TerminalSession(TEST_DIR, { NO_COLOR: "1" }, ["--unknown"]);
       await session.waitForExit();
       expect(session.output).toContain("unknown option");
       expect(session.output).not.toContain("\u001b[");
@@ -1957,32 +1995,32 @@ describe("poof CLI", () => {
       expect(result.exitCode).toBe(1);
     });
 
-    test("--upper= with an empty value is rejected", () => {
-      const result = spawnSync([POOF_BIN, "run", "--upper=", "--", "true"]);
+    test("--keep= with an empty value is rejected", () => {
+      const result = spawnSync([POOF_BIN, "--keep=", "--", "true"]);
       expect(result.stderr.toString()).toContain("not a directory");
       expect(result.exitCode).toBe(1);
     });
 
     test("exec of a directory reports 126", () => {
-      const result = spawnSync([POOF_BIN, "exec", "--", TEST_DIR]);
+      const result = spawnSync([POOF_BIN, "--no-keep", "--", TEST_DIR]);
       expect(result.stderr.toString()).toContain("cannot execute");
       expect(result.exitCode).toBe(126);
     });
   });
 
   // ============================================================================
-  // run mode with --upper: misc behavior
+  // A session that keeps its changes in a --keep dir: misc behavior
   // ============================================================================
-  describe("run mode with --upper", () => {
+  describe("sessions that keep to a --keep dir", () => {
     test("propagates the command exit code", () => {
       const upper = join(TEST_DIR, "runexit-upper");
-      const result = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", "exit 7"]);
+      const result = spawnSync([POOF_BIN, `--keep=${upper}`, "--", "sh", "-c", "exit 7"]);
       expect(result.exitCode).toBe(7);
     });
 
     test("sets IS_SANDBOX=1", () => {
       const upper = join(TEST_DIR, "runenv-upper");
-      const result = spawnSync([POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c", "echo $IS_SANDBOX"]);
+      const result = spawnSync([POOF_BIN, `--keep=${upper}`, "--", "sh", "-c", "echo $IS_SANDBOX"]);
       expect(result.stdout.toString().trim()).toBe("1");
     });
 
@@ -1990,7 +2028,7 @@ describe("poof CLI", () => {
       const upper = join(TEST_DIR, "runfail-upper");
       const target = join(TEST_DIR, "runfail-target.txt");
       const result = spawnSync([
-        POOF_BIN, "run", `--upper=${upper}`, "--", "sh", "-c",
+        POOF_BIN, `--keep=${upper}`, "--", "sh", "-c",
         `echo kept > ${target} && exit 3`,
       ]);
       expect(result.exitCode).toBe(3);
@@ -2100,21 +2138,24 @@ describe("poof CLI", () => {
       expect(result.exitCode).toBe(1);
     });
 
-    // The aliases keep their old argument shapes (enter still takes a directory,
-    // not a command); only the disposition is now spelled with flags.
-    test("the old mode words still work, and warn", () => {
-      for (const argv of [["exec", "--", "true"], ["run", "--", "true"], ["enter"]]) {
-        const result = spawnSync([POOF_BIN, ...argv], { cwd: dir });
-        expect(result.stderr.toString()).toContain(`'poof ${argv[0]}' is deprecated`);
-        expect(result.exitCode).toBe(0);
+    // The mode words are gone rather than deprecated, so nothing special happens
+    // to them: `poof exec` is a program named exec, which is the reading
+    // `poof <program>` gives it.
+    test("the old mode words are ordinary command names now", () => {
+      for (const word of ["exec", "run", "enter"]) {
+        const result = spawnSync([POOF_BIN, "--no-keep", word], { cwd: dir });
+        expect(result.stderr.toString()).toContain(`command not found: ${word}`);
+        expect(result.exitCode).toBe(127);
       }
     });
 
-    test("--upper still works, and warns", () => {
-      const upper = join(dir, "upper-stash");
-      const result = spawnSync([POOF_BIN, `--upper=${upper}`, "--", "true"]);
-      expect(result.stderr.toString()).toContain("--upper is deprecated");
-      expect(result.exitCode).toBe(0);
+    // --upper named the overlay mechanism rather than the intent; a keep dir is
+    // spelled --keep, and the old spelling is simply an unknown option.
+    test("--upper is no longer accepted", () => {
+      const flag = "--up" + "per=" + join(dir, "old-stash");
+      const result = spawnSync([POOF_BIN, flag, "--", "true"]);
+      expect(result.stderr.toString()).toContain("unknown option: --up" + "per=");
+      expect(result.exitCode).toBe(1);
     });
   });
 });
