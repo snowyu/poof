@@ -82,6 +82,28 @@ jobs:
       - name: Run tests
         run: sudo -E env "PATH=$PATH" bun test
 
+  # The same suite inside a container. The job above runs as root on a plain
+  # runner; this one runs as root on an overlayfs-backed root moved onto a tmpfs,
+  # with cgroup delegation set up by hand - the arrangement poof has to work with
+  # when it is itself run in Docker, and the one scripts/test-docker.sh exists for.
+  test-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.0"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run tests as root in a container
+        run: ./scripts/test-docker.sh
+
   package:
     needs: [build]
     runs-on: ubuntu-latest
