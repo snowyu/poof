@@ -792,7 +792,10 @@ poof stash list — List stashes left in /tmp
 
   12 change(s)  3h ago  /tmp/poof-4f2a9c1b7d3e8a55
 
-Stashes with no changes are skipped. poof never deletes a stash on its own.
+Stashes with no changes are skipped, and poof removes its own empty `/tmp/poof-<hex>`
+dir as the session ends - it had to exist for the mount, but there is nothing to
+replay. A stash that holds changes, and any `--keep=<dir>`, is never deleted on
+its own.
 ```
 
 ### `poof` (no args)
