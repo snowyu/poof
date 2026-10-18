@@ -81,6 +81,9 @@ var child_pid: i32 = 0;
 // exit (timeout or signal) must stash the changes instead of deleting them.
 var interactive_upper: ?[]const u8 = null;
 var interactive_changes_path: ?[]const u8 = null;
+// The stash path poof chose for itself (the auto /tmp/poof-<hex>), so an abnormal
+// exit can drop it when the session turned out to change nothing.
+var auto_stash: ?[]const u8 = null;
 
 fn signalHandler(sig: linux.SIG) callconv(.c) void {
     // Forward signal to child and wait for it to exit, so the mounts are torn down
@@ -109,6 +112,11 @@ fn signalHandler(sig: linux.SIG) callconv(.c) void {
     }
     // Don't destroy an interrupted session's work: stash it and say where.
     stashInteractiveChanges();
+    // Only the parent may remove the stash: inside the sandbox that directory is
+    // the live upper layer, and child_pid is 0 there.
+    if (child_pid > 0) {
+        if (auto_stash) |stash| discardEmptyStashDir(stash);
+    }
     // Cleanup cgroups and temp dirs
     sandbox.cleanupCgroup();
     sandbox.cleanupOverlayDirs();
@@ -493,6 +501,20 @@ fn handleExitApply(config: Config) void {
     } else {
         keepChanges(upper_dir);
     }
+}
+
+// An auto stash that turned out to hold nothing is litter: there is nothing for
+// `poof apply` to replay and `poof stash list` skips it, yet the directory had to
+// exist for the mount. Remove it once the session is over - but only poof's own
+// /tmp/poof-<hex> choice; a --keep=<dir> the user named is theirs to keep.
+fn discardEmptyStashDir(upper_dir: []const u8) void {
+    if (hasDirEntries(upper_dir)) return;
+    sandbox.deleteTree(upper_dir);
+}
+
+fn discardEmptyStash(config: Config) void {
+    if (config.keep != .auto) return;
+    if (config.upper_dir) |upper_dir| discardEmptyStashDir(upper_dir);
 }
 
 // True when a directory exists and holds at least one entry.
@@ -1022,6 +1044,7 @@ pub fn run(config: Config) u8 {
                 if (result.pid != 0) {
                     // Child exited
                     sandbox.cleanupCgroup();
+                    discardEmptyStash(config);
                     sandbox.cleanupOverlayDirs();
                     return exitCodeFromStatus(result.status);
                 }
@@ -1034,6 +1057,7 @@ pub fn run(config: Config) u8 {
                     _ = waitChild(child_pid, 0);
                     stashInteractiveChanges();
                     sandbox.cleanupCgroup();
+                    discardEmptyStash(config);
                     sandbox.cleanupOverlayDirs();
                     return 124; // Standard timeout exit code
                 }
@@ -1051,6 +1075,7 @@ pub fn run(config: Config) u8 {
                 handleExitApply(config);
             }
 
+            discardEmptyStash(config);
             sandbox.cleanupOverlayDirs();
 
             return exitCodeFromStatus(result.status);
@@ -1551,6 +1576,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 err("cannot create stash directory: {}", .{e});
                 return 1;
             };
+            auto_stash = config.upper_dir;
             if (config.apply_at_exit == .never) {
                 const hc = col(Color.bold ++ Color.cyan);
                 const rc = col(Color.reset);

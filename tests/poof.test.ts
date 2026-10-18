@@ -2075,6 +2075,16 @@ describe("poof CLI", () => {
       expect(listPoofStashes().filter((p) => !before.includes(p))).toEqual([]);
     });
 
+    // The stash dir has to exist for the mount, so it is only litter once the
+    // session turns out to have changed nothing: there is nothing to replay.
+    test("a session that changed nothing leaves no stash behind", () => {
+      const before = listPoofStashes();
+      const result = spawnSync([POOF_BIN, "--", "true"], { cwd: dir });
+
+      expect(result.exitCode).toBe(0);
+      expect(listPoofStashes().filter((p) => !before.includes(p))).toEqual([]);
+    });
+
     test("a failing command still keeps its changes for review", () => {
       const target = join(dir, "fail.txt");
       const result = spawnSync([POOF_BIN, "sh", "-c", `echo f > ${target} && exit 5`], { cwd: dir });
