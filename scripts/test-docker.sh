@@ -18,14 +18,16 @@ set -euo pipefail
 # then on the whole tree is one filesystem the sandbox can overlay.
 #
 # bun and zig are bind mounted from the host, so the image only needs a shell
-# and coreutils. Tests that want another tool skip when it is missing (the diff
-# view needs git); POOF_TEST_APT installs extra packages first, at the cost of
-# needing network. Everything is overridable if the defaults miss:
+# and coreutils. git is installed on top, because the diff view is `git diff
+# --no-index` and without it those tests skip; POOF_TEST_APT names more packages
+# (or "" for none, which is what an offline box wants). Everything is overridable
+# if the defaults miss:
 #
 #   ./scripts/test-docker.sh
 #   POOF_TEST_IMAGE=debian:trixie-slim ./scripts/test-docker.sh
 #   POOF_CONTAINER_RUNTIME=podman ./scripts/test-docker.sh
-#   POOF_TEST_APT="git vim" ./scripts/test-docker.sh
+#   POOF_TEST_APT="vim" ./scripts/test-docker.sh      # vim instead of git
+#   POOF_TEST_APT="" ./scripts/test-docker.sh         # install nothing
 
 IMAGE="${POOF_TEST_IMAGE:-ubuntu:24.04}"
 RUNTIME="${POOF_CONTAINER_RUNTIME:-docker}"
@@ -34,6 +36,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUN_BIN="${BUN_BIN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
 ZIG_HOME="${ZIG_HOME:-$(dirname "$(readlink -f "$(command -v zig || echo "$HOME/.zig/zig")")")}"
 GIT_COMMIT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo dev)"
+# "${POOF_TEST_APT-git}" rather than :- so that POOF_TEST_APT="" means "install
+# nothing" instead of falling back to the default.
+TEST_APT="${POOF_TEST_APT-git}"
 
 for f in "$BUN_BIN" "$ZIG_HOME/zig"; do
     if [[ ! -x "$f" ]]; then
@@ -52,17 +57,20 @@ done
     -v "$ZIG_HOME:/opt/zig:ro" \
     -v poof-zig-cache:/zig-cache \
     -e "GIT_COMMIT=$GIT_COMMIT" \
-    -e "POOF_TEST_APT=${POOF_TEST_APT:-}" \
+    -e "POOF_TEST_APT=$TEST_APT" \
     "$IMAGE" \
     unshare -m --fork --propagation private bash -euo pipefail -s -- "$@" <<'INNER'
 
 # --- optional tools ---------------------------------------------------------
 # Installed before the root is moved, so the packages land in the copied tree.
-# Only the diff-view tests need anything beyond coreutils (they want git).
+# Only the diff-view tests need anything beyond coreutils (they want git), and
+# they skip rather than fail without it - so a box with no network still gets a
+# full run, just with those two tests marked skipped.
 if [[ -n "${POOF_TEST_APT:-}" ]]; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq --no-install-recommends $POOF_TEST_APT
+    if ! apt-get update -qq || ! apt-get install -y -qq --no-install-recommends $POOF_TEST_APT; then
+        echo "warning: could not install: $POOF_TEST_APT - the tests that need it will skip" >&2
+    fi
 fi
 
 # --- cgroup delegation ------------------------------------------------------
