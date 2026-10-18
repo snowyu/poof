@@ -668,10 +668,46 @@ fn symlinkAt(target: [*:0]const u8, path: []const u8) void {
 // FUSE overlay state (for non-root mode)
 var fuse_overlay_pid: ?i32 = null;
 
+/// Where the fuse-overlayfs daemon's stderr is captured: beside the upper and work
+/// directories it was handed, which is a directory poof owns and cleans up.
+fn fuseLogPath(work: []const u8) ?[]const u8 {
+    const dir = std.fs.path.dirname(work) orelse return null;
+    return std.fmt.allocPrint(allocator, "{s}/fuse-overlayfs.log", .{dir}) catch null;
+}
+
+fn showFuseLog(path: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const n = readFile(path, &buf) catch return;
+    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        err("fuse-overlayfs: {s}", .{trimmed});
+    }
+}
+
+fn deleteFuseLog(path: []const u8) void {
+    const p = posix.toPosixPath(path) catch return;
+    _ = linux.unlink(&p);
+}
+
 fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merged: []const u8) !void {
     const opts = try std.fmt.allocPrint(allocator, "lowerdir={s},upperdir={s},workdir={s},squash_to_root", .{ lower, upper, work });
     const opts_z = try allocator.dupeSentinel(u8, opts, 0);
     const merged_z = try allocator.dupeSentinel(u8, merged, 0);
+
+    // fuse-overlayfs 1.13 hands libfuse a "lazytime" option whenever it runs in a
+    // user namespace, and libfuse 3.14 does not know that name: every unprivileged
+    // session opens with "unknown argument ignored: lazytime" on stderr, before the
+    // mount has even started. The daemon's other messages are worth reading -
+    // fusermount3 is the only thing that says why a mount was refused - so its stderr
+    // goes to a log beside the stash: shown when the mount fails, deleted when it does
+    // not, instead of being mixed into the command's own output.
+    const daemon_log = fuseLogPath(work);
+    // Declared in this order on purpose: deferred expressions run in reverse, so the
+    // log is read out before it is removed.
+    defer if (daemon_log) |lp| deleteFuseLog(lp);
+    errdefer if (daemon_log) |lp| showFuseLog(lp);
 
     // Fork and exec fuse-overlayfs in foreground mode (-f)
     // This keeps the FUSE daemon running as a child process
@@ -682,6 +718,18 @@ fn mountFuseOverlay(lower: []const u8, upper: []const u8, work: []const u8, merg
         // sandboxed process instead of lingering with the FUSE connection and our
         // inherited stdio pipes held open.
         _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(usize, @backingInt(linux.SIG.KILL)), 0, 0, 0);
+        if (daemon_log) |lp| {
+            if (posix.toPosixPath(lp)) |lp_z| {
+                const opened = linux.open(&lp_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
+                if (errnoFromSyscall(opened) == .SUCCESS) {
+                    const log_fd: posix.fd_t = @intCast(opened);
+                    // dup2 clears close-on-exec, so fd 2 survives the execve below.
+                    if (errnoFromSyscall(linux.dup2(log_fd, 2)) == .SUCCESS) {
+                        _ = linux.close(log_fd);
+                    }
+                }
+            } else |_| {}
+        }
         const argv = [_:null]?[*:0]const u8{
             "fuse-overlayfs",
             "-f", // foreground mode - required for chroot to work

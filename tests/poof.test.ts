@@ -1792,6 +1792,16 @@ describe("poof CLI", () => {
       expect(result.stderr.toString()).toContain("to-stderr");
     });
 
+    // fuse-overlayfs 1.13 hands libfuse a "lazytime" option whenever it runs in a
+    // user namespace, and libfuse 3.14 answers "unknown argument ignored: lazytime"
+    // before the mount has started. That is the daemon's business, not the command's:
+    // poof captures its stderr and only shows it when the mount actually fails.
+    test("the overlay daemon's startup chatter stays out of the output", () => {
+      const result = spawnSync([POOF_BIN, "exec", "--", "true"]);
+      expect(result.stderr.toString()).not.toContain("unknown argument ignored");
+      expect(result.exitCode).toBe(0);
+    });
+
     test("large stdout is not truncated", () => {
       const result = spawnSync([POOF_BIN, "exec", "sh", "-c", "head -c 200000 /dev/urandom | wc -c"]);
       expect(result.stdout.toString().trim()).toBe("200000");
@@ -1863,6 +1873,7 @@ describe("poof CLI", () => {
       proc.kill(2);
       expect(await proc.exited).toBe(130);
     });
+
   });
 
   // ============================================================================
