@@ -810,7 +810,7 @@ describe("poof CLI", () => {
         expect(stash).not.toBeNull();
 
         const listed = spawnSync([POOF_BIN, "stash", "list"]);
-        expect(listed.stdout.toString() + listed.stderr.toString()).toContain(stash!);
+        expect(listed.stdout.toString()).toContain(stash!);
 
         removeStash(stash!);
       });
@@ -1405,9 +1405,25 @@ describe("poof CLI", () => {
 
     test("stash list says so when there is nothing to apply", () => {
       const r = spawnSync([POOF_BIN, "stash", "list"]);
-      const out = r.stdout.toString() + r.stderr.toString();
+      const out = r.stdout.toString();
       expect(r.exitCode).toBe(0);
       expect(out.includes("no stashes with changes") || /poof-[0-9a-f]{16}/.test(out)).toBe(true);
+    });
+
+    // The listing is the requested result, so it is pipeable on stdout; only the
+    // advice printed after it is status, and stays on stderr.
+    test("stash list prints the listing on stdout", () => {
+      const named = join("/tmp", `poof-${"cd".repeat(8)}`);
+      mkdirSync(join(named, targetDir.slice(1)), { recursive: true });
+      writeFileSync(join(named, targetDir.slice(1), "piped.txt"), "x\n");
+      try {
+        const r = spawnSync([POOF_BIN, "stash", "list"]);
+        expect(r.stdout.toString()).toContain(named);
+        expect(r.stderr.toString()).not.toContain(named);
+        expect(r.stderr.toString()).toContain("apply one with");
+      } finally {
+        rmSync(named, { recursive: true, force: true });
+      }
     });
 
     test("apply without a stash argument fails", () => {
@@ -1646,7 +1662,7 @@ describe("poof CLI", () => {
       writeFileSync(join(named, targetDir.slice(1), "listed.txt"), "x\n");
       try {
         const r = spawnSync([POOF_BIN, "stash", "list"]);
-        expect(r.stdout.toString() + r.stderr.toString()).toContain(named);
+        expect(r.stdout.toString()).toContain(named);
       } finally {
         rmSync(named, { recursive: true, force: true });
       }
@@ -1658,7 +1674,7 @@ describe("poof CLI", () => {
       writeFileSync(join(named, "var", "junk.txt"), "x\n");
       try {
         const r = spawnSync([POOF_BIN, "stash", "list"]);
-        expect(r.stdout.toString() + r.stderr.toString()).not.toContain("poof-not-a-stash");
+        expect(r.stdout.toString()).not.toContain("poof-not-a-stash");
       } finally {
         rmSync(named, { recursive: true, force: true });
       }
@@ -1894,7 +1910,7 @@ describe("poof CLI", () => {
       expect(readFileSync(join(stash!, made), "utf-8").trim()).toBe("kept");
 
       const listed = spawnSync([POOF_BIN, "stash", "list"]);
-      expect(listed.stdout.toString() + listed.stderr.toString()).toContain(stash!);
+      expect(listed.stdout.toString()).toContain(stash!);
 
       cleanupStash(session.output);
       rmSync(dir, { recursive: true, force: true });

@@ -867,6 +867,11 @@ fn listStashes() u8 {
     };
     defer dir.close();
 
+    // The listing is the requested result, so it goes to stdout and can be piped;
+    // the advice printed after it is status, and goes back to stderr.
+    output.routeToStdout(true);
+    defer output.routeToStdout(false);
+
     const B = col(Color.bold);
     const D = col(Color.dim);
     const R = col(Color.reset);
@@ -900,10 +905,12 @@ fn listStashes() u8 {
 
     if (found == 0) {
         info("no stashes with changes in /tmp", .{});
+        output.routeToStdout(false);
         log("a --upper=<dir> stash is applied by path: poof apply <dir>", .{});
         return 0;
     }
     print("\n", .{});
+    output.routeToStdout(false);
     info("apply one with: poof apply <dir>", .{});
     return 0;
 }
